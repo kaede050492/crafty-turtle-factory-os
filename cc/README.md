@@ -90,6 +90,34 @@ left  type: workbench                     methods: ... craft ...
 
 タッチ判定は描画したボタンの実際のx/y座標から生成するため、文字スケールやMonitorサイズが変わっても`monitor_touch`の位置がずれません。画面が極端に小さい場合は、0.5スケールと1列レイアウトで操作ボタンを優先して表示します。
 
+## Tom's Peripherals GPU / Keyboard
+
+Tom's PeripheralsのGPUと3×5 Bitmap Monitorを同じWired Modemネットワークへ接続している場合、起動時にGPUを自動検出します。`refreshSize()`で接続画面を再検出し、`getSize()`のピクセルサイズから文字セルを計算して、既存の3×5向けレイアウトをGPUのVRAMへ1フレーム分だけ描画します。各行をMonitorへ個別送信せず、最後に`sync()`を1回だけ呼ぶため、画面更新が軽くなります。GPUの実在APIが揃わない場合は自動的に通常のAdvanced Monitorへ戻ります。
+
+Tom's Keyboardが検出されると`setFireNativeEvents(true)`を設定し、通常のCC:T `key` / `char`イベントとして扱います。複数接続などで自動検出できない場合は、冒頭の`cfg.gpu` / `cfg.keyboard`をPeripheral名に変更してください。
+
+キーボードショートカット:
+
+```text
+H / Home    HOMEへ戻る
+R           RECIPES
+I           REGISTER
+S           STOCK
+Q           QUEUE
+A           HOMEで全体AUTO、詳細でレシピAUTOを切替
+1 / 2 / 3   詳細画面でCRAFT 1 / 16 / 64
+T           詳細画面のTarget設定
++ / -       Targetを1ずつ増減
+Enter       Targetを保存
+Esc         前の画面へ戻る
+← / →      レシピ・在庫ページ切替、Targetを1ずつ調整
+Delete      詳細画面のレシピ削除
+```
+
+キーボード未接続でも、従来どおりMonitorのタッチ操作を利用できます。Tom's Bitmap Monitorを使用する場合はGPUの`tm_monitor_touch` / `tm_monitor_mouse_click`を文字セル座標へ変換して同じボタン判定を行います。GPUが一時切断・同期失敗した場合はそのフレームを停止し、接続されている通常Monitorへフォールバックします。
+
+参照: [Tom's Peripherals](https://modrinth.com/mod/toms-peripherals)、[GPU API](https://github.com/tom5454/Toms-Peripherals/wiki/GPUImpl)、[Keyboard API](https://github.com/tom5454/Toms-Peripherals/wiki/Keyboard)
+
 ## レシピ登録
 
 最終操作は次の4段階です。

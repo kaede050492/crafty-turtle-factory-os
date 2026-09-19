@@ -22,6 +22,8 @@ local cfg = {
   staging_side = "top",       -- turtle.suckUp() source
   craft_peripheral = "AUTO",   -- normally left=workbench/craft
   monitor = "AUTO",
+  gpu = "AUTO",               -- optional Tom's Peripherals GPU
+  keyboard = "AUTO",          -- optional Tom's Peripherals keyboard
   inventory_manager = "AUTO",  -- optional Advanced Peripherals hand reader
   output_side = "down",        -- finished products leave with turtle.dropDown()
 
@@ -64,6 +66,10 @@ local state = {
   timer = nil,
   storage_page = 1,
   ui_dirty = true,
+  display_mode = "monitor",
+  keyboard_name = nil,
+  keyboard_native = false,
+  gpu_name = nil,
 }
 
 -- wget only transfers the raw Lua file, so the running program also checks
@@ -110,6 +116,10 @@ local P = {
   craft = nil,
   monitor_name = nil,
   monitor = nil,
+  gpu_name = nil,
+  gpu = nil,
+  keyboard_name = nil,
+  keyboard = nil,
   manager_name = nil,
   manager = nil,
   turtle_inventory_name = nil,
@@ -202,11 +212,28 @@ local function isTransferInventory(name)
   return isInventory(name) and (hasMethod(name, "pushItems") or hasMethod(name, "pullItems"))
 end
 
+-- Tom's Peripherals does not require a single fixed peripheral type name for
+-- the GPU, so identify it by the documented methods we actually use.  The
+-- method check prevents a random peripheral exposing getSize() from being
+-- selected as a display.
+local function isTomGpu(name)
+  return hasMethod(name, "refreshSize")
+    and hasMethod(name, "getSize")
+    and hasMethod(name, "sync")
+    and hasMethod(name, "fill")
+    and hasMethod(name, "filledRectangle")
+    and hasMethod(name, "drawText")
+end
+
 local function typeMatches(name, expected)
   for _, actual in ipairs({ peripheral.getType(name) }) do
     if actual == expected then return true end
   end
   return false
+end
+
+local function isTomKeyboard(name)
+  return typeMatches(name, "keyboard") or hasMethod(name, "setFireNativeEvents")
 end
 
 local function sortedPeripheralNames()
@@ -219,6 +246,10 @@ local function resetPeripherals()
   P.resolved = false
   P.craft = nil
   P.monitor = nil
+  P.gpu = nil
+  P.keyboard = nil
+  P.gpu_name = nil
+  P.keyboard_name = nil
   P.manager = nil
   P.turtle_inventory_name = nil
   P.turtle_inventory = nil
@@ -322,6 +353,37 @@ local function resolvePeripherals(force)
   end
   local monitor = configured(monitorName) and peripheral.wrap(monitorName) or nil
 
+  local gpuName = cfg.gpu
+  if gpuName == "AUTO" then
+    for _, name in ipairs(sortedPeripheralNames()) do
+      if isTomGpu(name) then
+        gpuName = name
+        break
+      end
+    end
+  end
+  local gpu = configured(gpuName) and peripheral.wrap(gpuName) or nil
+  if gpu and not isTomGpu(gpuName) then gpu = nil end
+
+  local keyboardName = cfg.keyboard
+  if keyboardName == "AUTO" then
+    for _, name in ipairs(sortedPeripheralNames()) do
+      if isTomKeyboard(name) then
+        keyboardName = name
+        break
+      end
+    end
+  end
+  local keyboard = configured(keyboardName) and peripheral.wrap(keyboardName) or nil
+  if keyboard and not isTomKeyboard(keyboardName) then keyboard = nil end
+  local keyboardNative = false
+  if keyboard and type(keyboard.setFireNativeEvents) == "function" then
+    keyboardNative = pcall(keyboard.setFireNativeEvents, true)
+    if not keyboardNative then
+      log("WARN", "Tom's Keyboard native events could not be enabled")
+    end
+  end
+
   local managerName = cfg.inventory_manager
   if managerName == "AUTO" then
     for _, name in ipairs(sortedPeripheralNames()) do
@@ -338,7 +400,13 @@ local function resolvePeripherals(force)
   P.resolved = true
   P.craft_name, P.craft = configured(craftName) and craftName or nil, craft
   P.monitor_name, P.monitor = configured(monitorName) and monitorName or nil, monitor
+  P.gpu_name, P.gpu = configured(gpuName) and gpuName or nil, gpu
+  P.keyboard_name, P.keyboard = configured(keyboardName) and keyboardName or nil, keyboard
   P.manager_name, P.manager = configured(managerName) and managerName or nil, manager
+  state.gpu_name = P.gpu_name
+  state.keyboard_name = P.keyboard_name
+  state.keyboard_native = keyboardNative
+  state.display_mode = P.gpu and "gpu" or "monitor"
   scanInventories()
 
   local turtleInventoryName = cfg.turtle_inventory
@@ -402,6 +470,9 @@ local function scan()
     print("turtle inventory target: " .. tostring(p.turtle_inventory_name or "unavailable"))
     print("staging inventory: " .. tostring(p.staging_name or "unavailable"))
     print("STORAGE inventories: " .. tostring(#p.storage))
+    print("Tom's GPU: " .. tostring(p.gpu_name or "unavailable"))
+    print("Tom's keyboard: " .. tostring(p.keyboard_name or "unavailable") ..
+      (state.keyboard_native and " (native)" or " (prefixed/unknown)"))
   else
     print("factory resolve: " .. tostring(p))
   end
@@ -1896,6 +1967,119 @@ local monitorLayout = {
   compact = true,
 }
 
+-- Tom's GPU accepts ARGB colours, while CC:T colours are bit flags.  Keep
+-- this conversion local to the optional GPU surface so the normal Monitor
+-- path remains unchanged.
+local GPU_COLOURS = {
+  [colors.black] = 0xFF000000,
+  [colors.white] = 0xFFFFFFFF,
+  [colors.red] = 0xFFFF5555,
+  [colors.green] = 0xFF55FF55,
+  [colors.blue] = 0xFF5555FF,
+  [colors.yellow] = 0xFFFFFF55,
+  [colors.orange] = 0xFFFFAA00,
+  [colors.lightBlue] = 0xFF55FFFF,
+  [colors.lightGray] = 0xFFAAAAAA,
+  [colors.gray] = 0xFF555555,
+  [colors.pink] = 0xFFFF55FF,
+  [colors.purple] = 0xFFAA00AA,
+}
+
+local function gpuColour(colour)
+  return GPU_COLOURS[colour] or GPU_COLOURS[colors.white]
+end
+
+-- A small terminal-compatible adapter.  Existing GUI functions continue to
+-- operate in character cells, while Tom's GPU draws the same frame into its
+-- VRAM and sends it once with sync(). This avoids hundreds of network writes
+-- to an Advanced Monitor on each refresh.
+local function newGpuDisplay(gpu)
+  local surface = {
+    gpu = gpu,
+    width = 1,
+    height = 1,
+    pixel_width = 1,
+    pixel_height = 1,
+    text_scale = 1,
+    cell_width = 6,
+    cell_height = 8,
+    cursor_x = 1,
+    cursor_y = 1,
+    foreground = colors.white,
+    background = colors.black,
+  }
+
+  local function refreshMetrics()
+    local ok, pixelWidth, pixelHeight = pcall(gpu.getSize)
+    if not ok or type(pixelWidth) ~= "number" or type(pixelHeight) ~= "number" then
+      error("Tom's GPU getSize() failed", 0)
+    end
+    surface.pixel_width = math.max(1, math.floor(pixelWidth))
+    surface.pixel_height = math.max(1, math.floor(pixelHeight))
+    local measured = 6 * surface.text_scale
+    if type(gpu.getTextLength) == "function" then
+      local lengthOk, length = pcall(gpu.getTextLength, "M", surface.text_scale, 0)
+      if lengthOk and type(length) == "number" and length > 0 then measured = length end
+    end
+    surface.cell_width = math.max(1, math.floor(measured + 0.5))
+    surface.cell_height = math.max(1, math.floor(8 * surface.text_scale + 0.5))
+    surface.width = math.max(1, math.floor(surface.pixel_width / surface.cell_width))
+    surface.height = math.max(1, math.floor(surface.pixel_height / surface.cell_height))
+  end
+
+  function surface.getSize()
+    refreshMetrics()
+    return surface.width, surface.height
+  end
+
+  function surface.setTextScale(scale)
+    if type(scale) ~= "number" or scale <= 0 then error("invalid GPU text scale", 0) end
+    surface.text_scale = scale
+    refreshMetrics()
+  end
+
+  function surface.setCursorPos(x, y)
+    surface.cursor_x = math.max(1, math.floor(tonumber(x) or 1))
+    surface.cursor_y = math.max(1, math.floor(tonumber(y) or 1))
+  end
+
+  function surface.setTextColor(colour) surface.foreground = colour end
+  function surface.setTextColour(colour) surface.foreground = colour end
+  function surface.setBackgroundColor(colour) surface.background = colour end
+  function surface.setBackgroundColour(colour) surface.background = colour end
+
+  function surface.clear()
+    gpu.fill(gpuColour(surface.background))
+    surface.cursor_x, surface.cursor_y = 1, 1
+  end
+
+  function surface.write(text)
+    text = tostring(text or "")
+    if text == "" then return end
+    local pixelX = (surface.cursor_x - 1) * surface.cell_width + 1
+    local pixelY = (surface.cursor_y - 1) * surface.cell_height + 1
+    local pixelWidth = math.min(
+      surface.pixel_width - pixelX + 1,
+      math.max(1, math.floor(#text * surface.cell_width))
+    )
+    if pixelX <= surface.pixel_width and pixelY <= surface.pixel_height then
+      gpu.filledRectangle(pixelX, pixelY, pixelWidth, surface.cell_height, gpuColour(surface.background))
+      gpu.drawText(pixelX, pixelY, text, gpuColour(surface.foreground),
+        gpuColour(surface.background), surface.text_scale, 0)
+    end
+  end
+
+  function surface.pixelToCell(x, y)
+    return math.floor((tonumber(x) or 1) / surface.cell_width) + 1,
+      math.floor((tonumber(y) or 1) / surface.cell_height) + 1
+  end
+
+  function surface.sync() gpu.sync() end
+
+  refreshMetrics()
+  return surface
+end
+
 local function monitorSize(display)
   local ok, width, height = pcall(display.getSize)
   if not ok or type(width) ~= "number" or type(height) ~= "number" then
@@ -2037,18 +2221,20 @@ local function drawHome(display)
   local buttonStart = math.max(2, screenHeight - buttonRows + 1)
   line(display, 2, ("AUTO: %s  recipes=%d"):format(autoStatus, enabledAutoCount(recipes)),
     autoState.blocked and colors.red or colors.lightBlue)
-  if buttonStart >= 7 then
+  if buttonStart >= 9 then
     line(display, 3, ("STORAGE: %d  slots: %d/%d"):format(storageCount, usedSlots, totalSlots))
-    line(display, 4, "STAGING: " .. tostring(P.staging_name or "unavailable"))
-    line(display, 5, "TRANSFER: " .. tostring(P.turtle_inventory_name or "staging fallback"))
-    line(display, 6, "JOB: " .. tostring(state.auto_current or "idle"), colors.lightBlue)
-    line(display, 7, ("BUILD: %s %s"):format(
+    line(display, 4, ("DISPLAY: %s  KEY: %s"):format(
+      state.display_mode, P.keyboard_name and "ON" or "OFF"), colors.lightGray)
+    line(display, 5, "STAGING: " .. tostring(P.staging_name or "unavailable"))
+    line(display, 6, "TRANSFER: " .. tostring(P.turtle_inventory_name or "staging fallback"))
+    line(display, 7, "JOB: " .. tostring(state.auto_current or "idle"), colors.lightBlue)
+    line(display, 8, ("BUILD: %s %s"):format(
       shortName(buildInfo.commit, 10), tostring(buildInfo.time):gsub("T", " "):sub(1, 16)
     ), colors.lightGray)
-  elseif buttonStart >= 5 then
+  elseif buttonStart >= 6 then
     line(display, 3, ("STORAGE %d  SLOTS %d/%d"):format(storageCount, usedSlots, totalSlots))
-    line(display, 4, "JOB: " .. tostring(state.auto_current or "idle"), colors.lightBlue)
-    line(display, 5, ("BUILD: %s"):format(shortName(buildInfo.commit, 10)), colors.lightGray)
+    line(display, 4, ("DISPLAY %s KEY %s"):format(state.display_mode, P.keyboard_name and "ON" or "OFF"), colors.lightGray)
+    line(display, 5, "JOB: " .. tostring(state.auto_current or "idle"), colors.lightBlue)
   end
   if buttonStart > 2 then
     line(display, buttonStart - 1, state.message, state.error ~= "" and colors.red or colors.lightGray)
@@ -2256,6 +2442,10 @@ local function drawSettings(display)
     line(display, buttonStart - 2, "craft: " .. tostring(P.craft_name or "turtle.craft"))
     line(display, buttonStart - 1, "AUTO: " .. (autoState.global and "ON" or "OFF") ..
     (autoState.blocked and " (STOPPED)" or ""))
+    if buttonStart > 9 then
+      line(display, buttonStart - 6, "DISPLAY: " .. state.display_mode .. " key=" ..
+        tostring(P.keyboard_name or "off"), colors.lightGray)
+    end
   end
   buttonGrid(display, buttonStart, {
     { label = "<", action = { kind = "storage_prev" } },
@@ -2380,22 +2570,109 @@ local function handleAction(action)
   end
 end
 
+local function keyIs(key, name)
+  return type(keys) == "table" and keys[name] ~= nil and key == keys[name]
+end
+
+-- Keyboard input is deliberately mapped to the same actions as touch input.
+-- This keeps AUTO/Target/Queue state changes in one place and makes the
+-- shortcuts usable with either Tom's native events or standard CC:T events.
+local function actionForKey(key)
+  if keyIs(key, "escape") then
+    if state.page == "detail" then return { kind = "recipes" } end
+    if state.page == "target" then return { kind = "detail" } end
+    return { kind = "home" }
+  end
+  if keyIs(key, "home") or keyIs(key, "h") then return { kind = "home" } end
+  if keyIs(key, "r") then return { kind = "recipes" } end
+  if keyIs(key, "s") then return { kind = "stock" } end
+  if keyIs(key, "q") then return { kind = "queue" } end
+  if keyIs(key, "i") then return { kind = "register" } end
+
+  if state.page == "home" and keyIs(key, "a") then
+    return { kind = "global_auto" }
+  elseif state.page == "detail" then
+    if keyIs(key, "a") then return { kind = "recipe_auto" } end
+    if keyIs(key, "t") then return { kind = "target" } end
+    if keyIs(key, "one") then return { kind = "craft", amount = 1 } end
+    if keyIs(key, "two") then return { kind = "craft", amount = 16 } end
+    if keyIs(key, "three") then return { kind = "craft", amount = 64 } end
+    if keyIs(key, "delete") then return { kind = "delete" } end
+  elseif state.page == "target" then
+    if keyIs(key, "enter") then return { kind = "target_save" } end
+    if keyIs(key, "left") then return { kind = "target_adjust", amount = -1 } end
+    if keyIs(key, "right") then return { kind = "target_adjust", amount = 1 } end
+  elseif state.page == "recipes" then
+    if keyIs(key, "left") then return { kind = "recipes_prev" } end
+    if keyIs(key, "right") then return { kind = "recipes_next" } end
+  elseif state.page == "stock" then
+    if keyIs(key, "left") then return { kind = "stock_prev" } end
+    if keyIs(key, "right") then return { kind = "stock_next" } end
+  end
+  return nil
+end
+
+local function actionForChar(character)
+  if state.page == "target" then
+    if character == "+" or character == "=" then return { kind = "target_adjust", amount = 1 } end
+    if character == "-" or character == "_" then return { kind = "target_adjust", amount = -1 } end
+  end
+  return nil
+end
+
+local function runKeyboardAction(action)
+  if not action then return end
+  local ok, reason = pcall(handleAction, action)
+  if not ok then setMessage(reason, true) end
+  state.ui_dirty = true
+end
+
 local function guiLoop()
   local monitor = nil
+  local gpuDisplay = nil
+
+  local function renderDisplay()
+    return gpuDisplay or monitor
+  end
+
   local function reconnect()
     local ok, reason = pcall(resolvePeripherals, true)
-    if ok and P.monitor then
-      local candidate = P.monitor
-      local configuredOk, configuredReason = pcall(configureMonitor, candidate)
-      if configuredOk then
-        monitor = candidate
+    gpuDisplay = nil
+    if ok and (P.monitor or P.gpu) then
+      monitor = P.monitor
+      local monitorOk, monitorReason = true, nil
+      if monitor then
+        monitorOk, monitorReason = pcall(configureMonitor, monitor)
+      end
+      if not monitorOk then
+        monitor = nil
+        setMessage("Monitor初期化失敗: " .. tostring(monitorReason), true)
+      end
+
+      if P.gpu then
+        local gpuOk, gpuReason = pcall(function()
+          -- refreshSize() is the documented Tom's GPU startup operation.
+          P.gpu.refreshSize()
+          local candidate = newGpuDisplay(P.gpu)
+          configureMonitor(candidate)
+          gpuDisplay = candidate
+        end)
+        if not gpuOk then
+          log("WARN", "Tom's GPU disabled: " .. tostring(gpuReason))
+          gpuDisplay = nil
+          if not monitor then setMessage("GPU初期化失敗: " .. tostring(gpuReason), true) end
+        end
+      end
+
+      if renderDisplay() then
+        state.display_mode = gpuDisplay and "gpu" or "monitor"
         state.error = ""
       else
-        monitor = nil
-        setMessage("Monitor初期化失敗: " .. tostring(configuredReason), true)
+        setMessage("描画面が未接続です", true)
       end
     else
       monitor = nil
+      gpuDisplay = nil
       setMessage("Peripheral再接続待ち: " .. tostring(reason or "Monitorが未接続です"), true)
     end
   end
@@ -2403,25 +2680,43 @@ local function guiLoop()
   state.timer = os.startTimer(cfg.refresh_seconds)
 
   local function redraw()
-    if not monitor then return end
-    local drawn, reason = pcall(draw, monitor)
+    local display = renderDisplay()
+    if not display then return end
+    local drawn, reason = pcall(draw, display)
     if drawn then
+      if gpuDisplay then
+        local synced, syncReason = pcall(gpuDisplay.sync)
+        if not synced then
+          log("WARN", "Tom's GPU sync failed: " .. tostring(syncReason))
+          gpuDisplay = nil
+          state.display_mode = "monitor"
+          state.ui_dirty = true
+          return false
+        end
+      end
       state.ui_dirty = false
       return true
     end
     setMessage("Monitor更新失敗: " .. tostring(reason), true)
     local recovered = pcall(function()
-      configureMonitor(monitor)
-      monitor.setBackgroundColor(colors.black)
-      monitor.clear()
+      configureMonitor(display)
+      display.setBackgroundColor(colors.black)
+      display.clear()
       state.buttons = {}
-      line(monitor, 1, "FACTORY", colors.yellow)
-      line(monitor, 3, "GUI ERROR", colors.red)
-      line(monitor, 4, tostring(reason), colors.red)
+      line(display, 1, "FACTORY", colors.yellow)
+      line(display, 3, "GUI ERROR", colors.red)
+      line(display, 4, tostring(reason), colors.red)
+      if gpuDisplay then gpuDisplay.sync() end
     end)
     if not recovered then
-      resetPeripherals()
-      monitor = nil
+      if gpuDisplay then
+        gpuDisplay = nil
+        state.display_mode = "monitor"
+        state.ui_dirty = true
+      else
+        resetPeripherals()
+        monitor = nil
+      end
     end
     return false
   end
@@ -2450,6 +2745,36 @@ local function guiLoop()
           break
         end
       end
+    elseif gpuDisplay and event == "tm_monitor_touch" then
+      local x, y = gpuDisplay.pixelToCell(a, b)
+      for _, hit in ipairs(state.buttons) do
+        if x >= hit.x1 and x <= hit.x2 and y >= hit.y1 and y <= hit.y2 then
+          runKeyboardAction(hit.action)
+          redraw()
+          break
+        end
+      end
+    elseif gpuDisplay and event == "tm_monitor_mouse_click" and c == 1 then
+      local x, y = gpuDisplay.pixelToCell(a, b)
+      for _, hit in ipairs(state.buttons) do
+        if x >= hit.x1 and x <= hit.x2 and y >= hit.y1 and y <= hit.y2 then
+          runKeyboardAction(hit.action)
+          redraw()
+          break
+        end
+      end
+    elseif event == "key" and b ~= true then
+      local action = actionForKey(a)
+      if action then runKeyboardAction(action); redraw() end
+    elseif event == "char" then
+      local action = actionForChar(a)
+      if action then runKeyboardAction(action); redraw() end
+    elseif event == "tm_keyboard_key" and a == P.keyboard_name and c ~= true then
+      local action = actionForKey(b)
+      if action then runKeyboardAction(action); redraw() end
+    elseif event == "tm_keyboard_char" and a == P.keyboard_name then
+      local action = actionForChar(b)
+      if action then runKeyboardAction(action); redraw() end
     elseif event == "timer" and a == state.timer then
       state.timer = os.startTimer(cfg.refresh_seconds)
       local beforeAuto = state.auto_current
