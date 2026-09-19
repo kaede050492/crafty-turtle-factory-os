@@ -48,6 +48,7 @@ local state = {
   message = "",
   error = "",
   selected = nil,
+  target_value = nil,
   preview = nil,
   buttons = {},
   monitor_name = nil,
@@ -89,7 +90,9 @@ local autoState = {
 local stockCache = {
   signature = "",
   inventories = {},
+  outputInventories = {},
   totals = {},
+  outputTotals = {},
   displayNames = {},
   details = {},
   entries = {},
@@ -720,6 +723,7 @@ local function refreshStockCache(loadDisplayNames)
   resolvePeripherals()
   scanInventories()
   local inventories = {}
+  local outputInventories = {}
   local signatureParts = {}
   local reasons = {}
   local usedSlots, totalSlots = 0, 0
@@ -739,6 +743,22 @@ local function refreshStockCache(loadDisplayNames)
       if sizeOk and type(size) == "number" then totalSlots = totalSlots + size end
     end
   end
+  -- OUTPUT is not part of the material STOCK page, but it is part of the
+  -- finished-product total used by Target AUTO control. list() is cheap and
+  -- avoids getItemDetail() calls during the fast polling loop.
+  for _, entry in ipairs(P.outputs) do
+    if not inventories[entry.name] and not outputInventories[entry.name] then
+      local stacks, reason = inventoryStacks(entry.object)
+      outputInventories[entry.name] = {
+        name = entry.name,
+        object = entry.object,
+        stacks = stacks,
+        reason = reason,
+      }
+      signatureParts[#signatureParts + 1] = "OUTPUT:" .. listSignature(entry.name, stacks)
+      if reason then reasons[#reasons + 1] = entry.name .. ": " .. reason end
+    end
+  end
   table.sort(signatureParts)
   local signature = table.concat(signatureParts, "|")
   local reason = #reasons > 0 and table.concat(reasons, "; ") or nil
@@ -750,12 +770,21 @@ local function refreshStockCache(loadDisplayNames)
   end
 
   local totals = {}
+  local outputTotals = {}
   local displayNames = {}
   for _, inventory in pairs(inventories) do
     for slot, stack in pairs(inventory.stacks) do
       if stack and stack.name then
         totals[stack.name] = (totals[stack.name] or 0) + (stack.count or 0)
         if stack.displayName then displayNames[stack.name] = stack.displayName end
+      end
+    end
+  end
+
+  for _, inventory in pairs(outputInventories) do
+    for _, stack in pairs(inventory.stacks) do
+      if stack and stack.name then
+        outputTotals[stack.name] = (outputTotals[stack.name] or 0) + (stack.count or 0)
       end
     end
   end
@@ -785,7 +814,9 @@ local function refreshStockCache(loadDisplayNames)
 
   stockCache.signature = signature
   stockCache.inventories = inventories
+  stockCache.outputInventories = outputInventories
   stockCache.totals = totals
+  stockCache.outputTotals = outputTotals
   stockCache.displayNames = displayNames
   stockCache.displayLoaded = loadDisplayNames == true
   stockCache.outputCapacities = {}
@@ -824,21 +855,21 @@ local function stockCount(name, cache)
   return math.max(0, math.floor(tonumber(cache.totals[name]) or 0))
 end
 
+local function finishedStockCount(name, cache)
+  cache = cache or refreshStockCache(false)
+  local storageCount = tonumber(cache.totals[name]) or 0
+  local outputCount = tonumber(cache.outputTotals and cache.outputTotals[name]) or 0
+  return math.max(0, math.floor(storageCount + outputCount))
+end
+
 local function storageSummary()
   local cache = refreshStockCache(false)
   return #P.storage, cache.usedSlots or 0, cache.totalSlots or 0
 end
 
 local function outputStock(name)
-  resolvePeripherals()
-  local total = 0
-  for _, entry in ipairs(P.outputs) do
-    local stacks = inventoryStacks(entry.object)
-    for _, stack in pairs(stacks) do
-      if stack and stack.name == name then total = total + (stack.count or 0) end
-    end
-  end
-  return #P.outputs > 0 and total or nil
+  local cache = refreshStockCache(false)
+  return math.max(0, math.floor(tonumber(cache.outputTotals and cache.outputTotals[name]) or 0))
 end
 
 local function outputCapacity(name, defaultLimit)
@@ -1691,14 +1722,24 @@ local function queueAdd(recipe, amount, isAuto)
   return queue
 end
 
+local function targetPlan(recipe, cache)
+  cache = cache or refreshStockCache(false)
+  local target = math.max(0, math.floor(tonumber(recipe.target) or cfg.target_stock))
+  local current = finishedStockCount(recipe.output.name, cache)
+  local missing = math.max(0, target - current)
+  local outputPerCraft = math.max(1, math.floor(tonumber(recipe.output.count) or 1))
+  local requestedCrafts = math.ceil(missing / outputPerCraft)
+  return target, current, missing, requestedCrafts
+end
+
 local function queueAuto(recipe)
-  local current = stockCount(recipe.output.name)
-  local target = recipe.target or cfg.target_stock
-  local missing = target - current
-  if missing <= 0 then return false, "在庫 " .. current .. "/" .. target .. "で生産不要です。" end
-  local amount = math.max(1, math.ceil(missing / recipe.output.count))
+  local target, current, missing, amount = targetPlan(recipe)
+  if missing <= 0 then return false, "完成品在庫 " .. current .. "/" .. target .. "で生産不要です。" end
+  amount = math.min(cfg.batch_limit, amount)
+  if amount <= 0 then return false, "Targetまでの必要craft数が0です。" end
   queueAdd(recipe, amount, false)
-  return true, ("AUTOをキューへ追加: %s x%d"):format(recipe.name, amount)
+  return true, ("AUTOをキューへ追加: %s x%d (stock=%d/%d)"):format(
+    recipe.name, amount, current, target)
 end
 
 -- Add at most one automatic job per scan. This makes competing recipes
@@ -1733,14 +1774,17 @@ local function planAutoJob()
     if recipeAutoEnabled(name) then
       local recipe = normalizeRecipe(recipes[name])
       if recipe then
-        local batch = batchLimit(recipe, cfg.batch_limit, cache)
-        if batch > 0 then
-          queueAdd(recipe, batch, true)
-          state.auto_current = recipe.name
-          autoState.cursor = name
-          saveAuto()
-          state.queue_job = loadQueue()[1]
-          return true
+        local target, current, missing, requestedCrafts = targetPlan(recipe, cache)
+        if missing > 0 then
+          local batch = batchLimit(recipe, requestedCrafts, cache)
+          if batch > 0 then
+            queueAdd(recipe, batch, true)
+            state.auto_current = recipe.name
+            autoState.cursor = name
+            saveAuto()
+            state.queue_job = loadQueue()[1]
+            return true
+          end
         end
       end
     end
@@ -2081,13 +2125,14 @@ local function drawDetail(display)
   line(display, 2, recipe.name, colors.white)
   line(display, 3, recipe.output.displayName or recipe.output.name)
   line(display, 4, recipe.output.name)
-  line(display, 5, ("Output: %d  Input: %d  Target: %d"):format(
-    recipe.output.count, stockCount(recipe.output.name), recipe.target or cfg.target_stock
+  line(display, 5, ("OUTPUT/CRAFT: %d"):format(recipe.output.count))
+  line(display, 6, ("STOCK: %d  TARGET: %d"):format(
+    finishedStockCount(recipe.output.name), recipe.target or cfg.target_stock
   ))
-  line(display, 6, ("AUTO: %s  Global: %s"):format(
+  line(display, 7, ("AUTO: %s  Global: %s"):format(
     recipeAutoEnabled(recipe.name) and "ON" or "OFF", autoState.global and "ON" or "OFF"
   ), recipeAutoEnabled(recipe.name) and colors.lightBlue or colors.lightGray)
-  drawGrid(display, recipe.grid, 7)
+  drawGrid(display, recipe.grid, 8)
   if buttonStart > 9 then line(display, buttonStart - 1, state.message, state.error ~= "" and colors.red or colors.lightGray) end
   buttonGrid(display, buttonStart, {
     { label = "CRAFT 1", action = { kind = "craft", amount = 1 } },
@@ -2096,7 +2141,39 @@ local function drawDetail(display)
     { label = monitorLayout.compact and "AUTO" or (recipeAutoEnabled(recipe.name) and "AUTO OFF" or "AUTO ON"), action = { kind = "recipe_auto" } },
     { label = "DELETE", action = { kind = "delete" } },
     { label = "RECIPES", action = { kind = "recipes" } },
+    { label = "TARGET", action = { kind = "target" } },
     { label = "HOME", action = { kind = "home" } },
+  }, 2)
+end
+
+local function drawTarget(display)
+  drawHeader(display, "SET TARGET")
+  local recipe = state.selected
+  if not recipe then
+    line(display, 3, "No recipe selected", colors.red)
+    button(display, 1, 5, 8, "HOME", { kind = "home" })
+    return
+  end
+  local _, screenHeight = ensureMonitorLayout(display)
+  local value = math.max(0, math.floor(tonumber(state.target_value) or recipe.target or cfg.target_stock))
+  state.target_value = value
+  line(display, 2, recipe.name, colors.white)
+  line(display, 3, ("STOCK: %d"):format(finishedStockCount(recipe.output.name)), colors.lightBlue)
+  line(display, 4, ("TARGET: %d"):format(value), colors.yellow)
+  line(display, 5, ("OUTPUT/CRAFT: %d"):format(recipe.output.count), colors.lightGray)
+  line(display, 6, "Adjust with touch, then SAVE", colors.lightGray)
+  local buttonStart = math.max(8, screenHeight - 4)
+  if buttonStart > 8 then line(display, buttonStart - 1, state.message, state.error ~= "" and colors.red or colors.lightGray) end
+  buttonGrid(display, buttonStart, {
+    { label = "-1", action = { kind = "target_adjust", amount = -1 } },
+    { label = "+1", action = { kind = "target_adjust", amount = 1 } },
+    { label = "-16", action = { kind = "target_adjust", amount = -16 } },
+    { label = "+16", action = { kind = "target_adjust", amount = 16 } },
+    { label = "-64", action = { kind = "target_adjust", amount = -64 } },
+    { label = "+64", action = { kind = "target_adjust", amount = 64 } },
+    { label = "0", action = { kind = "target_set", value = 0 } },
+    { label = "SAVE", action = { kind = "target_save" } },
+    { label = "CANCEL", action = { kind = "detail" } },
   }, 2)
 end
 
@@ -2194,6 +2271,7 @@ local function draw(display)
   if state.page == "register" then drawRegister(display)
   elseif state.page == "recipes" then drawRecipes(display)
   elseif state.page == "detail" then drawDetail(display)
+  elseif state.page == "target" then drawTarget(display)
   elseif state.page == "stock" then drawStock(display)
   elseif state.page == "queue" then drawQueue(display)
   elseif state.page == "settings" then drawSettings(display)
@@ -2240,6 +2318,35 @@ local function handleAction(action)
     toggleGlobalAuto()
   elseif kind == "recipe_auto" then
     toggleRecipeAuto(state.selected)
+  elseif kind == "target" then
+    if state.selected then
+      state.target_value = math.max(0, math.floor(tonumber(state.selected.target) or cfg.target_stock))
+      state.page = "target"
+    end
+  elseif kind == "target_adjust" then
+    if state.selected then
+      state.target_value = math.max(0, math.floor(tonumber(state.target_value) or state.selected.target or cfg.target_stock)
+        + math.floor(tonumber(action.amount) or 0))
+    end
+  elseif kind == "target_set" then
+    if state.selected then state.target_value = math.max(0, math.floor(tonumber(action.value) or 0)) end
+  elseif kind == "target_save" then
+    if state.selected then
+      local recipes = loadRecipes()
+      local stored = recipes[state.selected.name]
+      if stored then
+        stored.target = math.max(0, math.floor(tonumber(state.target_value) or cfg.target_stock))
+        saveRecipes(recipes)
+        state.selected = normalizeRecipe(stored)
+        state.target_value = state.selected.target
+        state.page = "detail"
+        setMessage(("%s Target=%d に変更しました。"):format(state.selected.name, state.target_value), false)
+      else
+        setMessage("レシピが見つかりません: " .. state.selected.name, true)
+      end
+    end
+  elseif kind == "detail" then
+    state.page = "detail"
   elseif kind == "delete" then
     if state.selected then
       local recipes = loadRecipes()
@@ -2392,7 +2499,7 @@ local function cliRecipes(args)
     for _, name in ipairs(recipeKeys(recipes)) do
       local recipe = recipes[name]
       print(("%s -> %s x%d / stock=%d / %s"):format(
-        name, recipe.output.name, recipe.output.count, stockCount(recipe.output.name), recipeSummary(recipe)
+        name, recipe.output.name, recipe.output.count, finishedStockCount(recipe.output.name), recipeSummary(recipe)
       ))
     end
   elseif action == "capture" then
@@ -2405,7 +2512,8 @@ local function cliRecipes(args)
     print("name: " .. recipe.name)
     print("output: " .. recipe.output.name .. " x" .. recipe.output.count)
     print("display: " .. tostring(recipe.output.displayName))
-    print("stock: " .. stockCount(recipe.output.name))
+    print("stock: " .. finishedStockCount(recipe.output.name))
+    print("target: " .. tostring(recipe.target or cfg.target_stock))
     printGrid(recipe.grid)
   elseif action == "remove" or action == "delete" then
     local name = args[3]
