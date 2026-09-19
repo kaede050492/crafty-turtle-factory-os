@@ -564,7 +564,7 @@ local function runCycle(context)
           break
         end
 
-        local moved, transferReason = verifiedPush(context.source, destination,
+        local moved, transferReason = verifiedPush(context.source, destination.info,
           sourceSlot, sourceItem, remaining, remaining, destinationSlot)
         pushes = pushes + 1
         if not moved then
