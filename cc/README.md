@@ -92,7 +92,7 @@ left  type: workbench                     methods: ... craft ...
 
 ## Tom's Peripherals GPU / Keyboard
 
-Tom's PeripheralsのGPUと3×5 Bitmap Monitorを同じWired Modemネットワークへ接続している場合、起動時にGPUを自動検出します。`refreshSize()`で接続画面を再検出し、`getSize()`のピクセルサイズから文字セルを計算して、既存の3×5向けレイアウトをGPUのVRAMへ1フレーム分だけ描画します。各行をMonitorへ個別送信せず、最後に`sync()`を1回だけ呼ぶため、画面更新が軽くなります。GPUの実在APIが揃わない場合は自動的に通常のAdvanced Monitorへ戻ります。
+Tom's PeripheralsのGPUと3×5 Bitmap Monitorを同じWired Modemネットワークへ接続している場合、起動時にGPUを自動検出します。`refreshSize()`後に`setSize(64)`と`createWindow()`を使って描画コンテキストを作り、`getSize()`のピクセルサイズから文字セルを計算してVRAMへ1フレーム分だけ描画します。各行をMonitorへ個別送信せず、`window.sync()`→GPUの`sync()`を最後に行うため、画面更新が軽くなります。GPUの実在APIが揃わない場合は自動的に通常のAdvanced Monitorへ戻ります。
 
 Tom's Keyboardが検出されると`setFireNativeEvents(true)`を設定し、通常のCC:T `key` / `char`イベントとして扱います。複数接続などで自動検出できない場合は、冒頭の`cfg.gpu` / `cfg.keyboard`をPeripheral名に変更してください。
 
@@ -117,6 +117,14 @@ Delete      詳細画面のレシピ削除
 キーボード未接続でも、従来どおりMonitorのタッチ操作を利用できます。Tom's Bitmap Monitorを使用する場合はGPUの`tm_monitor_touch` / `tm_monitor_mouse_click`を文字セル座標へ変換して同じボタン判定を行います。GPUが一時切断・同期失敗した場合はそのフレームを停止し、接続されている通常Monitorへフォールバックします。
 
 参照: [Tom's Peripherals](https://modrinth.com/mod/toms-peripherals)、[GPU API](https://github.com/tom5454/Toms-Peripherals/wiki/GPUImpl)、[Keyboard API](https://github.com/tom5454/Toms-Peripherals/wiki/Keyboard)
+
+GPU単体の描画確認は次で行えます。画面に`GPU TEST`が出れば、Monitor接続とGPU描画は成功しています。
+
+```text
+factory scan
+factory gpu
+factory dashboard
+```
 
 ## レシピ登録
 
@@ -224,6 +232,7 @@ factory storage reset <peripheral>
 ```text
 factory scan
 factory dashboard
+factory gpu
 factory recipe list
 factory recipe capture
 factory recipe show <name>

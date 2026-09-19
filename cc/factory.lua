@@ -23,6 +23,7 @@ local cfg = {
   craft_peripheral = "AUTO",   -- normally left=workbench/craft
   monitor = "AUTO",
   gpu = "AUTO",               -- optional Tom's Peripherals GPU
+  gpu_resolution = 64,         -- Tom's Bitmap Monitor resolution per block
   keyboard = "AUTO",          -- optional Tom's Peripherals keyboard
   inventory_manager = "AUTO",  -- optional Advanced Peripherals hand reader
   output_side = "down",        -- finished products leave with turtle.dropDown()
@@ -216,20 +217,17 @@ end
 -- the GPU, so identify it by the documented methods we actually use.  The
 -- method check prevents a random peripheral exposing getSize() from being
 -- selected as a display.
-local function isTomGpu(name)
-  return hasMethod(name, "refreshSize")
-    and hasMethod(name, "getSize")
-    and hasMethod(name, "sync")
-    and hasMethod(name, "fill")
-    and hasMethod(name, "filledRectangle")
-    and hasMethod(name, "drawText")
-end
-
 local function typeMatches(name, expected)
   for _, actual in ipairs({ peripheral.getType(name) }) do
     if actual == expected then return true end
   end
   return false
+end
+
+local function isTomGpu(name)
+  return hasMethod(name, "refreshSize")
+    and hasMethod(name, "getSize")
+    and hasMethod(name, "sync")
 end
 
 local function isTomKeyboard(name)
@@ -471,6 +469,11 @@ local function scan()
     print("staging inventory: " .. tostring(p.staging_name or "unavailable"))
     print("STORAGE inventories: " .. tostring(#p.storage))
     print("Tom's GPU: " .. tostring(p.gpu_name or "unavailable"))
+    if p.gpu then
+      local gpuOk, width, height = pcall(p.gpu.getSize)
+      print("GPU size: " .. (gpuOk and (tostring(width) .. "x" .. tostring(height)) or "unavailable"))
+      print("GPU window: " .. (hasMethod(p.gpu_name, "createWindow") and "available" or "unavailable"))
+    end
     print("Tom's keyboard: " .. tostring(p.keyboard_name or "unavailable") ..
       (state.keyboard_native and " (native)" or " (prefixed/unknown)"))
   else
@@ -1993,16 +1996,47 @@ end
 -- operate in character cells, while Tom's GPU draws the same frame into its
 -- VRAM and sends it once with sync(). This avoids hundreds of network writes
 -- to an Advanced Monitor on each refresh.
-local function newGpuDisplay(gpu)
+local function newGpuDisplay(rootGpu)
+  -- On NeoForge 1.21.1, Tom's GPU examples use a child window for drawing.
+  -- Keep the root GPU for the final sync, but issue all draw calls to the
+  -- window context. A zero-tick yield lets refreshSize/setSize finish before
+  -- the window queries the connected Bitmap Monitor dimensions.
+  rootGpu.refreshSize()
+  if type(sleep) == "function" then sleep(0) end
+  if type(rootGpu.setSize) == "function" and cfg.gpu_resolution then
+    local resized, resizeReason = pcall(rootGpu.setSize, cfg.gpu_resolution)
+    if resized then
+      if type(sleep) == "function" then sleep(0) end
+    else
+      log("WARN", "Tom's GPU setSize skipped: " .. tostring(resizeReason))
+    end
+  end
+  local sizeOk, rootWidth, rootHeight = pcall(rootGpu.getSize)
+  if not sizeOk or type(rootWidth) ~= "number" or type(rootHeight) ~= "number" then
+    error("Tom's GPU getSize() failed", 0)
+  end
+  local gpu = rootGpu
+  if type(rootGpu.createWindow) == "function" then
+    local windowOk, window = pcall(rootGpu.createWindow, 1, 1, rootWidth, rootHeight)
+    if not windowOk or window == nil then
+      error("Tom's GPU createWindow() failed: " .. tostring(window), 0)
+    end
+    gpu = window
+  end
+  if type(gpu.filledRectangle) ~= "function" or type(gpu.drawText) ~= "function" then
+    error("Tom's GPU drawing methods are unavailable", 0)
+  end
+
   local surface = {
     gpu = gpu,
+    root_gpu = rootGpu,
     width = 1,
     height = 1,
     pixel_width = 1,
     pixel_height = 1,
     text_scale = 1,
     cell_width = 6,
-    cell_height = 8,
+    cell_height = 9,
     cursor_x = 1,
     cursor_y = 1,
     foreground = colors.white,
@@ -2016,13 +2050,10 @@ local function newGpuDisplay(gpu)
     end
     surface.pixel_width = math.max(1, math.floor(pixelWidth))
     surface.pixel_height = math.max(1, math.floor(pixelHeight))
-    local measured = 6 * surface.text_scale
-    if type(gpu.getTextLength) == "function" then
-      local lengthOk, length = pcall(gpu.getTextLength, "M", surface.text_scale, 0)
-      if lengthOk and type(length) == "number" and length > 0 then measured = length end
-    end
-    surface.cell_width = math.max(1, math.floor(measured + 0.5))
-    surface.cell_height = math.max(1, math.floor(8 * surface.text_scale + 0.5))
+    -- Tom's terminal emulator uses 6x9 pixels per character at scale 1.
+    -- Use the same metrics so drawText and tm_monitor_touch agree.
+    surface.cell_width = math.max(1, math.floor(6 * surface.text_scale + 0.5))
+    surface.cell_height = math.max(1, math.floor(9 * surface.text_scale + 0.5))
     surface.width = math.max(1, math.floor(surface.pixel_width / surface.cell_width))
     surface.height = math.max(1, math.floor(surface.pixel_height / surface.cell_height))
   end
@@ -2049,7 +2080,11 @@ local function newGpuDisplay(gpu)
   function surface.setBackgroundColour(colour) surface.background = colour end
 
   function surface.clear()
-    gpu.fill(gpuColour(surface.background))
+    if type(gpu.fill) == "function" then
+      gpu.fill(gpuColour(surface.background))
+    else
+      gpu.filledRectangle(1, 1, surface.pixel_width, surface.pixel_height, gpuColour(surface.background))
+    end
     surface.cursor_x, surface.cursor_y = 1, 1
   end
 
@@ -2065,7 +2100,7 @@ local function newGpuDisplay(gpu)
     if pixelX <= surface.pixel_width and pixelY <= surface.pixel_height then
       gpu.filledRectangle(pixelX, pixelY, pixelWidth, surface.cell_height, gpuColour(surface.background))
       gpu.drawText(pixelX, pixelY, text, gpuColour(surface.foreground),
-        gpuColour(surface.background), surface.text_scale, 0)
+        -1, surface.text_scale, 0)
     end
   end
 
@@ -2074,7 +2109,10 @@ local function newGpuDisplay(gpu)
       math.floor((tonumber(y) or 1) / surface.cell_height) + 1
   end
 
-  function surface.sync() gpu.sync() end
+  function surface.sync()
+    if gpu ~= rootGpu and type(gpu.sync) == "function" then gpu.sync() end
+    rootGpu.sync()
+  end
 
   refreshMetrics()
   return surface
@@ -2651,8 +2689,7 @@ local function guiLoop()
 
       if P.gpu then
         local gpuOk, gpuReason = pcall(function()
-          -- refreshSize() is the documented Tom's GPU startup operation.
-          P.gpu.refreshSize()
+          -- newGpuDisplay follows Tom's NeoForge-safe window drawing path.
           local candidate = newGpuDisplay(P.gpu)
           configureMonitor(candidate)
           gpuDisplay = candidate
@@ -2891,6 +2928,22 @@ local function cliVersion()
   if not ok then print("Remote check: " .. tostring(reason)) end
 end
 
+local function cliGpu()
+  local ok, p = pcall(resolvePeripherals, true)
+  if not ok then error(p, 0) end
+  if not p.gpu then error("Tom's GPUが見つかりません。factory scanを確認してください。", 0) end
+  local surface = newGpuDisplay(p.gpu)
+  configureMonitor(surface)
+  surface.setBackgroundColor(colors.black)
+  surface.clear()
+  state.buttons = {}
+  line(surface, 1, "GPU TEST", colors.yellow)
+  line(surface, 2, "factory gpu OK", colors.lightBlue)
+  line(surface, 3, ("size %dx%d"):format(monitorLayout.width, monitorLayout.height), colors.white)
+  surface.sync()
+  print("GPU test frame sent: " .. tostring(monitorLayout.width) .. "x" .. tostring(monitorLayout.height))
+end
+
 local function cliCraft(args)
   local recipes = loadRecipes()
   local recipe = findRecipe(recipes, args[2])
@@ -2922,6 +2975,7 @@ local ok, reason = pcall(function()
   if mode == "scan" then scan()
   elseif mode == "dashboard" or mode == "gui" then runGui()
   elseif mode == "version" then cliVersion()
+  elseif mode == "gpu" then cliGpu()
   elseif mode == "recipe" then cliRecipes(args)
   elseif mode == "stock" then cliStock(args)
   elseif mode == "storage" then cliStorage(args)
@@ -2934,6 +2988,7 @@ local ok, reason = pcall(function()
   else
     print("factory dashboard")
     print("factory version")
+    print("factory gpu")
     print("factory scan")
     print("factory recipe list|capture|show <name>|remove <name>")
     print("factory stock [search <text>]")
