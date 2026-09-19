@@ -701,6 +701,12 @@ local function gridSnapshot()
   return grid
 end
 
+local function emptyGrid()
+  local grid = {}
+  for logical = 1, #CRAFT_SLOTS do grid[logical] = "" end
+  return grid
+end
+
 local function hasIngredient(grid)
   for _, entry in ipairs(grid) do
     if entry ~= "" and itemName(entry) then return true end
@@ -2383,7 +2389,9 @@ local function drawRegister(display)
   drawHeader(display, "REGISTER RECIPE")
   local _, screenHeight = ensureMonitorLayout(display)
   local grid, reason = captureGrid()
-  state.preview = grid or state.preview
+  -- Do not show an old preview when the physical Crafty grid is empty.
+  -- The register screen must reflect the current turtle inventory.
+  state.preview = grid or emptyGrid()
   line(display, 2, "Grid: 1 2 3 / 5 6 7 / 9 10 11", colors.lightGray)
   if not grid then line(display, 3, reason, colors.red) end
   drawGrid(display, state.preview, 3)
@@ -2616,7 +2624,7 @@ local function handleAction(action)
   elseif kind == "capture" then
     local grid, reason = captureGrid()
     if grid then state.preview, state.message, state.error = grid, "CAPTURED preview", ""
-    else setMessage(reason, true) end
+    else state.preview, state.message = emptyGrid(), ""; setMessage(reason, true) end
   elseif kind == "test_register" then
     local ok, result = testAndRegister()
     if ok then state.selected, state.page, state.error = result, "detail", ""
