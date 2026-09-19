@@ -2246,26 +2246,33 @@ local function guiLoop()
   end
   reconnect()
   state.timer = os.startTimer(cfg.refresh_seconds)
-  while true do
-    if monitor then
-      local drawn, reason = pcall(draw, monitor)
-      if not drawn then
-        setMessage("Monitor更新失敗: " .. tostring(reason), true)
-        local recovered = pcall(function()
-          configureMonitor(monitor)
-          monitor.setBackgroundColor(colors.black)
-          monitor.clear()
-          state.buttons = {}
-          line(monitor, 1, "FACTORY", colors.yellow)
-          line(monitor, 3, "GUI ERROR", colors.red)
-          line(monitor, 4, tostring(reason), colors.red)
-        end)
-        if not recovered then
-          resetPeripherals()
-          monitor = nil
-        end
-      end
+
+  local function redraw()
+    if not monitor then return end
+    local drawn, reason = pcall(draw, monitor)
+    if drawn then return true end
+    setMessage("Monitor更新失敗: " .. tostring(reason), true)
+    local recovered = pcall(function()
+      configureMonitor(monitor)
+      monitor.setBackgroundColor(colors.black)
+      monitor.clear()
+      state.buttons = {}
+      line(monitor, 1, "FACTORY", colors.yellow)
+      line(monitor, 3, "GUI ERROR", colors.red)
+      line(monitor, 4, tostring(reason), colors.red)
+    end)
+    if not recovered then
+      resetPeripherals()
+      monitor = nil
     end
+    return false
+  end
+
+  -- Draw once before waiting. Do not draw at the top of every event loop:
+  -- queueLoop emits a 0.2 second timer, and clearing the monitor for each of
+  -- those unrelated events makes a small Advanced Monitor visibly flicker.
+  redraw()
+  while true do
     local event, a, b, c = os.pullEventRaw()
     if event == "terminate" then return
     elseif monitor and event == "monitor_touch" and a == P.monitor_name then
@@ -2273,18 +2280,17 @@ local function guiLoop()
         if b >= hit.x1 and b <= hit.x2 and c >= hit.y1 and c <= hit.y2 then
           local ok, reason = pcall(handleAction, hit.action)
           if not ok then setMessage(reason, true) end
-          if monitor then
-            local redrawOk, redrawReason = pcall(draw, monitor)
-            if not redrawOk then setMessage("Monitor更新失敗: " .. tostring(redrawReason), true) end
-          end
+          redraw()
           break
         end
       end
     elseif event == "timer" and a == state.timer then
       state.timer = os.startTimer(cfg.refresh_seconds)
+      redraw()
     elseif event == "peripheral" or event == "peripheral_detach" then
       resetPeripherals()
       reconnect()
+      redraw()
     end
   end
 end
