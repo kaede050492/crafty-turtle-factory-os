@@ -134,7 +134,7 @@ HOMEまたはSETTINGSの `AUTO ON/OFF` で全体の自動クラフトを切り�
 
 AUTOがONでキューが空になると、約0.2秒（数tick）ごとにWired Network上の全 `STORAGE` inventoryの `list()` を読みます。各inventoryのslotをItem ID/countでインデックス化し、同じItem IDが複数倉庫・複数slotに分散していても合計在庫として扱います。登録済みで個別AUTOがONのレシピをラウンドロビン順に比較し、材料が揃ったレシピを1つ選び、材料から計算した最大batch（最大64）だけをキューへ入れます。
 
-材料不足なら何もせず待機します。Turtle自身がgeneric inventoryとして検出できる場合は、各STORAGE inventoryから`pushItems()`で物理slotへ直接転送します。検出できない場合は、各STORAGEから専用STAGINGへ必要な材料だけを`pushItems()`し、STAGINGが一種類の正しいItem ID/countだけであることを確認してから `turtle.suckUp()` で物理slotへ吸引します。転送前後にItem ID/countを再確認し、部分転送・異物・Peripheral切断を検出したらクラフトせず、可能な範囲でSTORAGEへ返却します。完成品は可能ならOUTPUT inventoryへ `pushItems()` で返し、使えない場合は `turtle.dropDown()` へfallbackします。
+材料不足なら何もせず待機します。Turtle自身がgeneric inventoryとして検出できる場合は、各STORAGE inventoryから`pushItems()`で物理slotへ直接転送します。検出できない場合は、各STORAGEから専用STAGINGへ必要な材料だけを`pushItems()`し、STAGINGが一種類の正しいItem ID/countだけであることを確認してから `turtle.suckUp()` で物理slotへ吸引します。転送前後にItem ID/countを再確認し、部分転送・異物・Peripheral切断を検出したらクラフトせず、可能な範囲でSTORAGEへ返却します。完成品は可能ならOUTPUT inventoryへ `pushItems()` で返し、使えない場合はPeripheral未認識の下側Barrel/Chestにも `turtle.dropDown()` でfallbackします。下側容器が満杯の場合は完成品をslot16に残したまま安全停止します。
 
 出力排出、残り物返却、クラフト、peripheral接続のいずれかで安全に処理できない場合はAUTOを停止し、材料を別の完成品倉庫へ誤排出しません。停止後は原因を確認してAUTOをOFF→ONにすると再開します。AUTOジョブは手動Queueより優先されず、手動Queueが残っている間は新しいAUTOジョブを追加しません。
 

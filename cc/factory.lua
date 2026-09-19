@@ -1189,8 +1189,12 @@ local function pushOutputOrDrop(slot, name, amount)
       return false, ("完成品の部分転送: %d/%d"):format(moved, amount)
     end
   end
-  if cfg.output_side and peripheral.isPresent(cfg.output_side) then
-    return dropSlotDown(slot, amount)
+  -- The lower chest/barrel may be invisible to the peripheral API. Use the
+  -- turtle API as the real fallback instead of gating it on isPresent().
+  if cfg.output_side then
+    local dropped, dropReason = dropSlotDown(slot, amount)
+    if dropped then return true end
+    return false, dropReason or "下側output chestへの排出に失敗しました。"
   end
   return false, "OUTPUT inventoryも下側output chestもありません。"
 end
