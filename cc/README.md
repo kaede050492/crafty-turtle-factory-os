@@ -70,10 +70,11 @@ GitHubの公開Rawから直接取得できます。Crafty Turtleで次を実行�
 wget https://raw.githubusercontent.com/kaede050492/crafty-turtle-factory-os/main/cc/factory.lua /factory
 wget https://raw.githubusercontent.com/kaede050492/crafty-turtle-factory-os/main/cc/scan.lua /scan
 factory scan
+factory version
 factory dashboard
 ```
 
-`wget`はCC:Tweakedの標準シェルコマンドです。引数なしで `factory` を起動する場合は、startup.luaから `shell.run("factory")` としてください。更新時は同じ2つの`wget`を再実行します。
+`wget`はCC:Tweakedの標準シェルコマンドです。`factory version`またはHOMEの`BUILD`行で、GitHub `main`のcommit SHAとcommit時刻を確認できます。HTTP APIが使えない場合もFactory自体は起動し、commit表示だけが`unavailable`になります。引数なしで `factory` を起動する場合は、startup.luaから `shell.run("factory")` としてください。更新時は同じ2つの`wget`を再実行します。
 
 `factory scan` では、少なくとも次の検出結果を確認します。
 

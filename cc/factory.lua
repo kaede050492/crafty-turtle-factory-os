@@ -36,6 +36,7 @@ local cfg = {
   batch_limit = 64,
   target_stock = 32,
   output_slot = 16,
+  github_api = "https://api.github.com/repos/kaede050492/crafty-turtle-factory-os/commits/main",
 }
 
 -- The physical Crafty Turtle grid is not logical slots 1..9.
@@ -61,6 +62,15 @@ local state = {
   auto_blocked = false,
   timer = nil,
   storage_page = 1,
+  ui_dirty = true,
+}
+
+-- wget only transfers the raw Lua file, so the running program also checks
+-- GitHub's public commit endpoint and shows the exact current main revision.
+-- This is informational only: a failed HTTP request must never stop Factory.
+local buildInfo = {
+  commit = "unavailable",
+  time = "unavailable",
 }
 
 -- AUTO is intentionally disabled for every recipe until the user enables it.
@@ -140,7 +150,36 @@ end
 local function setMessage(message, isError)
   state.message = tostring(message or "")
   state.error = isError and state.message or ""
+  state.ui_dirty = true
   log(isError and "ERROR" or "INFO", state.message)
+end
+
+local function updateBuildInfo()
+  if type(http) ~= "table" or type(http.get) ~= "function" then
+    return false, "HTTP API unavailable"
+  end
+  local ok, response = pcall(http.get, cfg.github_api, {
+    ["User-Agent"] = "CC-T Factory OS",
+    ["Accept"] = "application/vnd.github+json",
+  })
+  if not ok or not response then
+    return false, tostring(response or "GitHub API connection failed")
+  end
+  local readOk, body = pcall(response.readAll)
+  pcall(response.close)
+  if not readOk or type(body) ~= "string" then
+    return false, "GitHub API response could not be read"
+  end
+  local commit = body:match('"sha"%s*:%s*"([0-9a-fA-F]+)"')
+  local commitTime = body:match('"committer"%s*:%s*{.-"date"%s*:%s*"([^"]+)"')
+    or body:match('"date"%s*:%s*"([^"]+)"')
+  if not commit then
+    return false, "GitHub API did not return a commit SHA"
+  end
+  buildInfo.commit = commit
+  buildInfo.time = commitTime or "unknown"
+  state.ui_dirty = true
+  return true
 end
 
 local function hasMethod(name, method)
@@ -1848,10 +1887,11 @@ local function configureMonitor(display)
 end
 
 local function ensureMonitorLayout(display)
-  local width, height = monitorSize(display)
-  if monitorLayout.display ~= display
-    or monitorLayout.width ~= width
-    or monitorLayout.height ~= height then
+  -- Re-measuring and changing text scale during every draw can clear an
+  -- Advanced Monitor while its wired-network update is still in flight. The
+  -- layout is selected once when the peripheral is connected; a peripheral
+  -- reconnect/refresh deliberately selects it again.
+  if monitorLayout.display ~= display or monitorLayout.width < 1 or monitorLayout.height < 1 then
     configureMonitor(display)
   end
   return monitorLayout.width, monitorLayout.height
@@ -1954,9 +1994,13 @@ local function drawHome(display)
     line(display, 4, "STAGING: " .. tostring(P.staging_name or "unavailable"))
     line(display, 5, "TRANSFER: " .. tostring(P.turtle_inventory_name or "staging fallback"))
     line(display, 6, "JOB: " .. tostring(state.auto_current or "idle"), colors.lightBlue)
+    line(display, 7, ("BUILD: %s %s"):format(
+      shortName(buildInfo.commit, 10), tostring(buildInfo.time):gsub("T", " "):sub(1, 16)
+    ), colors.lightGray)
   elseif buttonStart >= 5 then
     line(display, 3, ("STORAGE %d  SLOTS %d/%d"):format(storageCount, usedSlots, totalSlots))
     line(display, 4, "JOB: " .. tostring(state.auto_current or "idle"), colors.lightBlue)
+    line(display, 5, ("BUILD: %s"):format(shortName(buildInfo.commit, 10)), colors.lightGray)
   end
   if buttonStart > 2 then
     line(display, buttonStart - 1, state.message, state.error ~= "" and colors.red or colors.lightGray)
@@ -2250,7 +2294,10 @@ local function guiLoop()
   local function redraw()
     if not monitor then return end
     local drawn, reason = pcall(draw, monitor)
-    if drawn then return true end
+    if drawn then
+      state.ui_dirty = false
+      return true
+    end
     setMessage("Monitor更新失敗: " .. tostring(reason), true)
     local recovered = pcall(function()
       configureMonitor(monitor)
@@ -2272,6 +2319,14 @@ local function guiLoop()
   -- queueLoop emits a 0.2 second timer, and clearing the monitor for each of
   -- those unrelated events makes a small Advanced Monitor visibly flicker.
   redraw()
+  pcall(updateBuildInfo)
+  if state.ui_dirty then redraw() end
+
+  local function jobKey(job)
+    if not job then return "" end
+    return recipeName(job.recipe) .. ":" .. tostring(job.amount)
+  end
+
   while true do
     local event, a, b, c = os.pullEventRaw()
     if event == "terminate" then return
@@ -2286,7 +2341,18 @@ local function guiLoop()
       end
     elseif event == "timer" and a == state.timer then
       state.timer = os.startTimer(cfg.refresh_seconds)
-      redraw()
+      local beforeAuto = state.auto_current
+      local beforeJob = jobKey(state.queue_job)
+      local beforeStock = stockCache.signature
+      local refreshed, refreshReason = pcall(refreshStockCache, false)
+      if not refreshed then
+        setMessage("在庫更新失敗: " .. tostring(refreshReason), true)
+      elseif beforeAuto ~= state.auto_current
+        or beforeJob ~= jobKey(state.queue_job)
+        or beforeStock ~= stockCache.signature then
+        state.ui_dirty = true
+      end
+      if state.ui_dirty then redraw() end
     elseif event == "peripheral" or event == "peripheral_detach" then
       resetPeripherals()
       reconnect()
@@ -2380,6 +2446,14 @@ local function cliStorage(args)
   end
 end
 
+local function cliVersion()
+  local ok, reason = updateBuildInfo()
+  print("Factory OS")
+  print("GitHub commit: " .. tostring(buildInfo.commit))
+  print("Commit time: " .. tostring(buildInfo.time))
+  if not ok then print("Remote check: " .. tostring(reason)) end
+end
+
 local function cliCraft(args)
   local recipes = loadRecipes()
   local recipe = findRecipe(recipes, args[2])
@@ -2410,6 +2484,7 @@ local mode = args[1] or "dashboard"
 local ok, reason = pcall(function()
   if mode == "scan" then scan()
   elseif mode == "dashboard" or mode == "gui" then runGui()
+  elseif mode == "version" then cliVersion()
   elseif mode == "recipe" then cliRecipes(args)
   elseif mode == "stock" then cliStock(args)
   elseif mode == "storage" then cliStorage(args)
@@ -2421,6 +2496,7 @@ local ok, reason = pcall(function()
     end
   else
     print("factory dashboard")
+    print("factory version")
     print("factory scan")
     print("factory recipe list|capture|show <name>|remove <name>")
     print("factory stock [search <text>]")
