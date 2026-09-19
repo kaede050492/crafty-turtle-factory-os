@@ -1,0 +1,8 @@
+.gradle-build-cache/
+
+# Local/server notes and CC:T runtime state
+/PROJECT_MEMORY.md
+/factory*.db
+/factory*.db.tmp
+/factory*.db.bak
+/factory*.log
