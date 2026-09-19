@@ -83,6 +83,12 @@ left  type: workbench                     methods: ... craft ...
 <monitor> type: monitor
 ```
 
+## 3x3 Advanced Monitor
+
+`factory dashboard` 起動時にMonitorの`getSize()`を読み取り、1.0 / 0.75 / 0.5の順で画面に収まる文字スケールを自動選択します。3x3 Monitorでは小さいレイアウトへ切り替わり、HOMEのAUTO、CRAFT、RECIPES、REGISTER、STOCK、QUEUE、SETTINGSを2列（さらに狭い場合は1列）で表示します。
+
+タッチ判定は描画したボタンの実際のx/y座標から生成するため、文字スケールやMonitorサイズが変わっても`monitor_touch`の位置がずれません。画面が極端に小さい場合は、0.5スケールと1列レイアウトで操作ボタンを優先して表示します。
+
 ## レシピ登録
 
 最終操作は次の4段階です。

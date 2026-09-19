@@ -1797,40 +1797,139 @@ local function setColour(display, foreground, background)
   if display.setBackgroundColour then display.setBackgroundColour(background or colors.black) end
 end
 
+-- Monitor dimensions are measured after changing the text scale.  A 3x3
+-- Advanced Monitor is often smaller than the old fixed 40x16 layout, so all
+-- drawing and hitboxes use this same measured coordinate system.
+local MONITOR_SCALES = { 1.0, 0.75, 0.5 }
+local monitorLayout = {
+  display = nil,
+  width = 0,
+  height = 0,
+  scale = 0.5,
+  compact = true,
+}
+
+local function monitorSize(display)
+  local ok, width, height = pcall(display.getSize)
+  if not ok or type(width) ~= "number" or type(height) ~= "number" then
+    return 1, 1
+  end
+  return math.max(1, math.floor(width)), math.max(1, math.floor(height))
+end
+
+local function configureMonitor(display)
+  -- Read the initial size as soon as the monitor is connected.  This also
+  -- supports monitor implementations which do not expose a useful size until
+  -- getSize() has been called once.
+  local initialWidth, initialHeight = monitorSize(display)
+  local selectedScale = 0.5
+  local selectedWidth, selectedHeight = initialWidth, initialHeight
+
+  -- Prefer the largest readable scale which still fits the responsive HOME
+  -- layout.  If a 3x3 monitor cannot reach that size, 0.5 is the most useful
+  -- fallback because it provides the most character cells.
+  for _, scale in ipairs(MONITOR_SCALES) do
+    local scaleOk = pcall(display.setTextScale, scale)
+    if scaleOk then
+      local width, height = monitorSize(display)
+      selectedScale, selectedWidth, selectedHeight = scale, width, height
+      if width >= 28 and height >= 16 then break end
+    end
+  end
+
+  pcall(display.setTextScale, selectedScale)
+  selectedWidth, selectedHeight = monitorSize(display)
+  monitorLayout.display = display
+  monitorLayout.width = selectedWidth
+  monitorLayout.height = selectedHeight
+  monitorLayout.scale = selectedScale
+  monitorLayout.compact = selectedWidth < 28 or selectedHeight < 16
+  state.monitor_size = ("%dx%d scale=%.2f"):format(selectedWidth, selectedHeight, selectedScale)
+end
+
+local function ensureMonitorLayout(display)
+  local width, height = monitorSize(display)
+  if monitorLayout.display ~= display
+    or monitorLayout.width ~= width
+    or monitorLayout.height ~= height then
+    configureMonitor(display)
+  end
+  return monitorLayout.width, monitorLayout.height
+end
+
 local function line(display, y, text, colour)
-  local width, height = display.getSize()
+  local width, height = ensureMonitorLayout(display)
   if y < 1 or y > height then return end
   if colour then setColour(display, colour, colors.black) end
   display.setCursorPos(1, y)
   display.write(tostring(text or ""):sub(1, width))
 end
 
-local function button(display, x, y, width, label, action)
-  local screenWidth, height = display.getSize()
+local function lineAt(display, x, y, text, colour)
+  local screenWidth, height = ensureMonitorLayout(display)
+  x = math.max(1, math.floor(tonumber(x) or 1))
   if y < 1 or y > height or x > screenWidth then return end
-  local text = ("[%-" .. width .. "s]"):format(label)
-  text = text:sub(1, math.max(1, screenWidth - x + 1))
+  if colour then setColour(display, colour, colors.black) end
+  local maxLength = screenWidth - x + 1
   display.setCursorPos(x, y)
-  display.write(text)
+  display.write(tostring(text or ""):sub(1, maxLength))
+end
+
+local function button(display, x, y, width, label, action)
+  local screenWidth, height = ensureMonitorLayout(display)
+  if y < 1 or y > height or x > screenWidth then return end
+  width = math.max(1, math.floor(tonumber(width) or 1))
+  width = math.min(width, math.max(1, screenWidth - x - 1))
+  local labelText = tostring(label or "")
+  if #labelText > width then labelText = labelText:sub(1, width) end
+  local text = "[" .. labelText .. string.rep(" ", width - #labelText) .. "]"
+  local visibleText = text:sub(1, math.max(1, screenWidth - x + 1))
+  lineAt(display, x, y, visibleText)
   state.buttons[#state.buttons + 1] = {
-    x1 = x, y1 = y, x2 = x + #text - 1, y2 = y, action = action,
+    x1 = x, y1 = y, x2 = x + #visibleText - 1, y2 = y, action = action,
   }
 end
 
+local function buttonGrid(display, y, items, columns)
+  local screenWidth, screenHeight = ensureMonitorLayout(display)
+  columns = math.max(1, math.min(columns or 2, #items))
+  local gap = 1
+  local cellWidth = math.floor((screenWidth - gap * (columns - 1)) / columns)
+  if cellWidth < 5 and columns > 1 then
+    columns = 1
+    cellWidth = screenWidth
+  end
+  local contentWidth = math.max(1, cellWidth - 2)
+  for index, item in ipairs(items) do
+    local row = math.floor((index - 1) / columns)
+    local column = (index - 1) % columns
+    local x = 1 + column * (cellWidth + gap)
+    local targetY = y + row
+    if targetY <= screenHeight then
+      button(display, x, targetY, contentWidth, item.label, item.action)
+    end
+  end
+  return math.ceil(#items / columns)
+end
+
 local function drawGrid(display, grid, top)
+  local screenWidth = ensureMonitorLayout(display)
+  local cellWidth = math.max(1, math.floor((screenWidth - 2) / 3))
   for row = 1, 3 do
     local cells = {}
     for column = 1, 3 do
       local logical = (row - 1) * 3 + column
       local entry = grid and grid[logical] or ""
       local text = type(entry) == "table" and (entry.displayName or entry.name) or entry
-      cells[#cells + 1] = ("%-10s"):format(shortName(text, 9))
+      local cell = shortName(text, math.max(1, cellWidth - 1))
+      cells[#cells + 1] = cell .. string.rep(" ", math.max(0, cellWidth - #cell))
     end
-    line(display, top + row - 1, table.concat(cells, "|"), colors.lightBlue)
+    lineAt(display, 1, top + row - 1, table.concat(cells, "|"), colors.lightBlue)
   end
 end
 
 local function drawHeader(display, text)
+  ensureMonitorLayout(display)
   display.setBackgroundColor(colors.black)
   display.clear()
   state.buttons = {}
@@ -1843,69 +1942,92 @@ local function drawHome(display)
   local storageCount, usedSlots, totalSlots = storageSummary()
   local autoStatus = autoState.global and "ON" or "OFF"
   if autoState.blocked then autoStatus = autoStatus .. "/STOP" end
-  line(display, 3, "Crafty Turtle Factory OS", colors.white)
-  line(display, 4, ("STORAGE: %d  slots: %d/%d"):format(storageCount, usedSlots, totalSlots))
-  line(display, 5, "STAGING: " .. tostring(P.staging_name or "unavailable"))
-  line(display, 6, "turtle transfer: " .. tostring(P.turtle_inventory_name or "staging fallback"))
-  line(display, 7, "craft: " .. tostring(P.craft_name or "turtle.craft"))
-  line(display, 8, state.message, state.error ~= "" and colors.red or colors.lightGray)
-  line(display, 9, ("AUTO: %s  recipes=%d"):format(autoStatus, enabledAutoCount(recipes)),
+  local screenWidth, screenHeight = ensureMonitorLayout(display)
+  local columns = screenWidth >= 20 and 2 or 1
+  local itemCount = 7
+  local buttonRows = math.ceil(itemCount / columns)
+  local buttonStart = math.max(2, screenHeight - buttonRows + 1)
+  line(display, 2, ("AUTO: %s  recipes=%d"):format(autoStatus, enabledAutoCount(recipes)),
     autoState.blocked and colors.red or colors.lightBlue)
-  line(display, 10, "AUTO JOB: " .. tostring(state.auto_current or "idle"), colors.lightBlue)
-  button(display, 1, 11, 10, autoState.global and "AUTO OFF" or "AUTO ON", { kind = "global_auto" })
-  button(display, 14, 11, 10, "CRAFT", { kind = "recipes" })
-  button(display, 28, 11, 11, "RECIPES", { kind = "recipes" })
-  button(display, 1, 13, 10, "REGISTER", { kind = "register" })
-  button(display, 14, 13, 8, "STOCK", { kind = "stock" })
-  button(display, 1, 15, 8, "QUEUE", { kind = "queue" })
-  button(display, 14, 15, 8, "SETTINGS", { kind = "settings" })
+  if buttonStart >= 7 then
+    line(display, 3, ("STORAGE: %d  slots: %d/%d"):format(storageCount, usedSlots, totalSlots))
+    line(display, 4, "STAGING: " .. tostring(P.staging_name or "unavailable"))
+    line(display, 5, "TRANSFER: " .. tostring(P.turtle_inventory_name or "staging fallback"))
+    line(display, 6, "JOB: " .. tostring(state.auto_current or "idle"), colors.lightBlue)
+  elseif buttonStart >= 5 then
+    line(display, 3, ("STORAGE %d  SLOTS %d/%d"):format(storageCount, usedSlots, totalSlots))
+    line(display, 4, "JOB: " .. tostring(state.auto_current or "idle"), colors.lightBlue)
+  end
+  if buttonStart > 2 then
+    line(display, buttonStart - 1, state.message, state.error ~= "" and colors.red or colors.lightGray)
+  end
+  buttonGrid(display, buttonStart, {
+    { label = "AUTO", action = { kind = "global_auto" } },
+    { label = "CRAFT", action = { kind = "recipes" } },
+    { label = "RECIPES", action = { kind = "recipes" } },
+    { label = "REGISTER", action = { kind = "register" } },
+    { label = "STOCK", action = { kind = "stock" } },
+    { label = "QUEUE", action = { kind = "queue" } },
+    { label = "SETTINGS", action = { kind = "settings" } },
+  }, columns)
 end
 
 local function drawRegister(display)
   drawHeader(display, "REGISTER RECIPE")
+  local _, screenHeight = ensureMonitorLayout(display)
   local grid, reason = captureGrid()
   state.preview = grid or state.preview
+  line(display, 2, "Grid: 1 2 3 / 5 6 7 / 9 10 11", colors.lightGray)
   if not grid then line(display, 3, reason, colors.red) end
-  line(display, 3, "Physical slots: 1 2 3 / 5 6 7 / 9 10 11", colors.lightGray)
-  drawGrid(display, state.preview, 5)
-  line(display, 9, "CAPTURE = refresh preview", colors.lightGray)
-  line(display, 10, "TEST & REGISTER = craft once, detect output, save", colors.lightGray)
-  button(display, 1, 12, 10, "CAPTURE", { kind = "capture" })
-  button(display, 13, 12, 17, "TEST & REGISTER", { kind = "test_register" })
-  button(display, 32, 12, 8, "CANCEL", { kind = "home" })
-  line(display, 14, state.message, state.error ~= "" and colors.red or colors.lightGray)
+  drawGrid(display, state.preview, 3)
+  local buttonStart = math.max(7, screenHeight - 1)
+  if buttonStart > 7 then line(display, buttonStart - 1, state.message, state.error ~= "" and colors.red or colors.lightGray) end
+  buttonGrid(display, buttonStart, {
+    { label = monitorLayout.compact and "TEST" or "TEST & REGISTER", action = { kind = "test_register" } },
+    { label = "CAPTURE", action = { kind = "capture" } },
+    { label = "CANCEL", action = { kind = "home" } },
+  }, 2)
 end
 
 local function drawRecipes(display)
   drawHeader(display, "RECIPES")
+  local screenWidth, screenHeight = ensureMonitorLayout(display)
   local recipes = loadRecipes()
   local keys = recipeKeys(recipes)
-  local pages = math.max(1, math.ceil(#keys / cfg.page_size))
+  local buttonStart = math.max(4, screenHeight - 1)
+  local firstListRow, lastListRow = 3, buttonStart - 2
+  local visible = math.max(1, math.min(cfg.page_size, lastListRow - firstListRow + 1))
+  local pages = math.max(1, math.ceil(#keys / visible))
   state.recipes_page = math.max(1, math.min(state.recipes_page, pages))
-  local first = (state.recipes_page - 1) * cfg.page_size + 1
+  local first = (state.recipes_page - 1) * visible + 1
   line(display, 2, ("Page %d/%d"):format(state.recipes_page, pages), colors.lightGray)
-  for offset = 0, cfg.page_size - 1 do
+  for offset = 0, visible - 1 do
     local name = keys[first + offset]
     if name then
       local recipe = recipes[name]
-      line(display, 3 + offset, ("%-22s %s x%d"):format(
-        shortName(name, 22), shortName(recipe.output.name, 16), recipe.output.count
+      local row = firstListRow + offset
+      line(display, row, ("%-" .. math.max(1, screenWidth - 11) .. "s"):format(
+        shortName(name, math.max(1, screenWidth - 11))
       ))
-      button(display, 31, 3 + offset, 9, "OPEN", { kind = "recipe", name = name })
+      button(display, math.max(1, screenWidth - 8), row, 6, "OPEN", { kind = "recipe", name = name })
     end
   end
-  button(display, 1, 12, 5, "<", { kind = "recipes_prev" })
-  button(display, 8, 12, 5, ">", { kind = "recipes_next" })
-  button(display, 16, 12, 9, "REGISTER", { kind = "register" })
-  button(display, 29, 12, 8, "HOME", { kind = "home" })
+  buttonGrid(display, buttonStart, {
+    { label = "<", action = { kind = "recipes_prev" } },
+    { label = ">", action = { kind = "recipes_next" } },
+    { label = "REGISTER", action = { kind = "register" } },
+    { label = "HOME", action = { kind = "home" } },
+  }, 2)
 end
 
 local function drawDetail(display)
   local recipe = state.selected
   drawHeader(display, "RECIPE DETAIL")
+  local _, screenHeight = ensureMonitorLayout(display)
+  local buttonStart = math.max(9, screenHeight - 3)
   if not recipe then
     line(display, 3, "No recipe selected", colors.red)
-    button(display, 1, 12, 8, "HOME", { kind = "home" })
+    button(display, 1, buttonStart, 8, "HOME", { kind = "home" })
     return
   end
   line(display, 2, recipe.name, colors.white)
@@ -1918,61 +2040,75 @@ local function drawDetail(display)
     recipeAutoEnabled(recipe.name) and "ON" or "OFF", autoState.global and "ON" or "OFF"
   ), recipeAutoEnabled(recipe.name) and colors.lightBlue or colors.lightGray)
   drawGrid(display, recipe.grid, 7)
-  button(display, 1, 12, 8, "CRAFT 1", { kind = "craft", amount = 1 })
-  button(display, 11, 12, 9, "CRAFT 16", { kind = "craft", amount = 16 })
-  button(display, 22, 12, 8, "CRAFT 64", { kind = "craft", amount = 64 })
-  button(display, 31, 12, 8, recipeAutoEnabled(recipe.name) and "AUTO OFF" or "AUTO ON", { kind = "recipe_auto" })
-  button(display, 1, 14, 8, "DELETE", { kind = "delete" })
-  button(display, 12, 14, 8, "RECIPES", { kind = "recipes" })
-  button(display, 24, 14, 8, "HOME", { kind = "home" })
-  line(display, 16, state.message, state.error ~= "" and colors.red or colors.lightGray)
+  if buttonStart > 9 then line(display, buttonStart - 1, state.message, state.error ~= "" and colors.red or colors.lightGray) end
+  buttonGrid(display, buttonStart, {
+    { label = "CRAFT 1", action = { kind = "craft", amount = 1 } },
+    { label = "CRAFT 16", action = { kind = "craft", amount = 16 } },
+    { label = "CRAFT 64", action = { kind = "craft", amount = 64 } },
+    { label = monitorLayout.compact and "AUTO" or (recipeAutoEnabled(recipe.name) and "AUTO OFF" or "AUTO ON"), action = { kind = "recipe_auto" } },
+    { label = "DELETE", action = { kind = "delete" } },
+    { label = "RECIPES", action = { kind = "recipes" } },
+    { label = "HOME", action = { kind = "home" } },
+  }, 2)
 end
 
 local function drawStock(display)
   local entries, reason = stockEntries(state.stock_query)
   drawHeader(display, "WAREHOUSE")
+  local screenWidth, screenHeight = ensureMonitorLayout(display)
+  local buttonStart = math.max(7, screenHeight - 2)
   line(display, 2, ("sort=%s ids=%s search=%s"):format(
     state.stock_sort, state.stock_show_ids and "on" or "off", state.stock_query ~= "" and state.stock_query or "-"
   ), colors.lightGray)
   line(display, 3, ("STORAGE=%d  items=%d"):format(#P.storage, #entries), colors.lightBlue)
-  local pages = math.max(1, math.ceil(#entries / cfg.page_size))
+  local lastListRow = buttonStart - 2
+  local visible = math.max(1, math.min(cfg.page_size, lastListRow - 3 + 1))
+  local pages = math.max(1, math.ceil(#entries / visible))
   state.stock_page = math.max(1, math.min(state.stock_page, pages))
-  local first = (state.stock_page - 1) * cfg.page_size + 1
-  for offset = 0, cfg.page_size - 1 do
+  local first = (state.stock_page - 1) * visible + 1
+  for offset = 0, visible - 1 do
     local entry = entries[first + offset]
     if entry then
       local label = state.stock_show_ids and entry.name or entry.displayName or shortName(entry.name, 24)
-      line(display, 4 + offset, ("%8d  %s"):format(entry.count, label))
+      line(display, 4 + offset, ("%8d  %s"):format(entry.count, shortName(label, math.max(1, screenWidth - 10))))
     end
   end
-  if reason then line(display, 11, reason, colors.red) end
-  button(display, 1, 12, 5, "<", { kind = "stock_prev" })
-  button(display, 8, 12, 5, ">", { kind = "stock_next" })
-  button(display, 15, 12, 8, "SEARCH", { kind = "stock_search" })
-  button(display, 25, 12, 6, "SORT", { kind = "stock_sort" })
-  button(display, 33, 12, 7, "ID", { kind = "stock_ids" })
-  button(display, 1, 14, 10, "REFRESH", { kind = "refresh" })
-  button(display, 28, 14, 8, "HOME", { kind = "home" })
+  if reason and buttonStart > 4 then line(display, buttonStart - 1, reason, colors.red) end
+  buttonGrid(display, buttonStart, {
+    { label = "<", action = { kind = "stock_prev" } },
+    { label = ">", action = { kind = "stock_next" } },
+    { label = "SEARCH", action = { kind = "stock_search" } },
+    { label = "SORT", action = { kind = "stock_sort" } },
+    { label = "ID", action = { kind = "stock_ids" } },
+    { label = "REFRESH", action = { kind = "refresh" } },
+    { label = "HOME", action = { kind = "home" } },
+  }, 2)
 end
 
 local function drawQueue(display)
   drawHeader(display, "QUEUE")
+  local _, screenHeight = ensureMonitorLayout(display)
+  local buttonStart = math.max(5, screenHeight - 1)
   local queue = loadQueue()
   if state.queue_job then line(display, 3, "RUNNING: " .. recipeName(state.queue_job.recipe), colors.lightBlue) end
   for index, job in ipairs(queue) do
-    if index <= 7 then
+    if 3 + index < buttonStart - 1 then
       line(display, 3 + index, ("%d. %-22s x%d"):format(index, shortName(recipeName(job.recipe), 22), job.amount))
     end
   end
-  button(display, 1, 12, 8, "CLEAR", { kind = "queue_clear" })
-  button(display, 14, 12, 8, "REFRESH", { kind = "refresh" })
-  button(display, 28, 12, 8, "HOME", { kind = "home" })
+  buttonGrid(display, buttonStart, {
+    { label = "CLEAR", action = { kind = "queue_clear" } },
+    { label = "REFRESH", action = { kind = "refresh" } },
+    { label = "HOME", action = { kind = "home" } },
+  }, 2)
 end
 
 local function drawSettings(display)
   drawHeader(display, "SETTINGS")
+  local screenWidth, screenHeight = ensureMonitorLayout(display)
+  local buttonStart = math.max(5, screenHeight - 2)
   resolvePeripherals()
-  local pageSize = 7
+  local pageSize = math.max(1, math.min(7, buttonStart - 3))
   local pages = math.max(1, math.ceil(#P.inventories / pageSize))
   state.storage_page = math.max(1, math.min(state.storage_page, pages))
   line(display, 2, ("Inventories Page %d/%d"):format(state.storage_page, pages), colors.lightGray)
@@ -1980,26 +2116,33 @@ local function drawSettings(display)
   for offset = 0, pageSize - 1 do
     local entry = P.inventories[first + offset]
     if entry then
-      line(display, 3 + offset, ("%-22s"):format(shortName(entry.name, 22)))
-      button(display, 28, 3 + offset, 12, entry.role, { kind = "storage_role", name = entry.name })
+      local row = 3 + offset
+      local roleX = math.max(1, screenWidth - 11)
+      lineAt(display, 1, row, shortName(entry.name, math.max(1, roleX - 2)))
+      button(display, roleX, row, 9, entry.role, { kind = "storage_role", name = entry.name })
     end
   end
-  line(display, 11, "Tap role: STORAGE/STAGING/CRAFTER/OUTPUT/IGNORE", colors.lightGray)
-  line(display, 12, "staging: " .. tostring(P.staging_name or "unavailable"),
+  if buttonStart > 8 then
+    line(display, buttonStart - 5, "Tap role: STORAGE/STAGING/CRAFTER/OUTPUT/IGNORE", colors.lightGray)
+    line(display, buttonStart - 4, "staging: " .. tostring(P.staging_name or "unavailable"),
     P.staging_name and colors.lightBlue or colors.red)
-  line(display, 13, "turtle inventory: " .. tostring(P.turtle_inventory_name or "unavailable"),
+    line(display, buttonStart - 3, "turtle: " .. tostring(P.turtle_inventory_name or "unavailable"),
     P.turtle_inventory_name and colors.lightBlue or colors.red)
-  line(display, 14, "craft: " .. tostring(P.craft_name or "turtle.craft"))
-  line(display, 15, "AUTO: " .. (autoState.global and "ON" or "OFF") ..
+    line(display, buttonStart - 2, "craft: " .. tostring(P.craft_name or "turtle.craft"))
+    line(display, buttonStart - 1, "AUTO: " .. (autoState.global and "ON" or "OFF") ..
     (autoState.blocked and " (STOPPED)" or ""))
-  button(display, 1, 16, 5, "<", { kind = "storage_prev" })
-  button(display, 8, 16, 5, ">", { kind = "storage_next" })
-  button(display, 15, 16, 8, "SCAN", { kind = "scan" })
-  button(display, 25, 16, 10, autoState.global and "AUTO OFF" or "AUTO ON", { kind = "global_auto" })
-  button(display, 36, 16, 5, "HOME", { kind = "home" })
+  end
+  buttonGrid(display, buttonStart, {
+    { label = "<", action = { kind = "storage_prev" } },
+    { label = ">", action = { kind = "storage_next" } },
+    { label = "SCAN", action = { kind = "scan" } },
+    { label = "AUTO", action = { kind = "global_auto" } },
+    { label = "HOME", action = { kind = "home" } },
+  }, 2)
 end
 
 local function draw(display)
+  ensureMonitorLayout(display)
   if state.page == "register" then drawRegister(display)
   elseif state.page == "recipes" then drawRecipes(display)
   elseif state.page == "detail" then drawDetail(display)
@@ -2087,9 +2230,15 @@ local function guiLoop()
   local function reconnect()
     local ok, reason = pcall(resolvePeripherals, true)
     if ok and P.monitor then
-      monitor = P.monitor
-      monitor.setTextScale(0.5)
-      state.error = ""
+      local candidate = P.monitor
+      local configuredOk, configuredReason = pcall(configureMonitor, candidate)
+      if configuredOk then
+        monitor = candidate
+        state.error = ""
+      else
+        monitor = nil
+        setMessage("Monitor初期化失敗: " .. tostring(configuredReason), true)
+      end
     else
       monitor = nil
       setMessage("Peripheral再接続待ち: " .. tostring(reason or "Monitorが未接続です"), true)
@@ -2102,8 +2251,19 @@ local function guiLoop()
       local drawn, reason = pcall(draw, monitor)
       if not drawn then
         setMessage("Monitor更新失敗: " .. tostring(reason), true)
-        resetPeripherals()
-        monitor = nil
+        local recovered = pcall(function()
+          configureMonitor(monitor)
+          monitor.setBackgroundColor(colors.black)
+          monitor.clear()
+          state.buttons = {}
+          line(monitor, 1, "FACTORY", colors.yellow)
+          line(monitor, 3, "GUI ERROR", colors.red)
+          line(monitor, 4, tostring(reason), colors.red)
+        end)
+        if not recovered then
+          resetPeripherals()
+          monitor = nil
+        end
       end
     end
     local event, a, b, c = os.pullEventRaw()
@@ -2113,6 +2273,10 @@ local function guiLoop()
         if b >= hit.x1 and b <= hit.x2 and c >= hit.y1 and c <= hit.y2 then
           local ok, reason = pcall(handleAction, hit.action)
           if not ok then setMessage(reason, true) end
+          if monitor then
+            local redrawOk, redrawReason = pcall(draw, monitor)
+            if not redrawOk then setMessage("Monitor更新失敗: " .. tostring(redrawReason), true) end
+          end
           break
         end
       end
