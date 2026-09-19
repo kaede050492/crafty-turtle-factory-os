@@ -56,11 +56,26 @@ logical 3 -> physical 3       logical 6 -> physical 7       logical 9 -> physica
 
 1. Storage用のChest、Barrel、Drawer等へWired Modemを接続し、同じCC:T Wired Networkへ参加させる。
 2. 専用STAGING Chest/BarrelをCrafty Turtleの上(top)に置き、Wired Modemへ接続する。STAGINGは材料を一種類ずつ短時間だけ保持します。
-3. `factory storage list` またはMonitorのSETTINGSで、材料倉庫を `STORAGE`、上側inventoryを `STAGING`、完成品倉庫を `OUTPUT`、対象外を `IGNORE` に設定する。
-4. Crafty Turtle自身が汎用inventory Peripheralとして検出できる場合は、従来どおり`pushItems()`で正しいcraft slotへ直接転送します。検出できない場合はSTAGINGへ自動fallbackし、`STAGING → turtle.suckUp() → craft slot` の順で材料を検証します。
-5. 下に完成品用Barrelを置く。Wired OUTPUTへ直接返却できない場合は `turtle.dropDown()` へfallbackします。下BarrelがPeripheralとして認識されない場合も排出できますが、満杯の事前容量検査はできないため、排出失敗時に安全停止します。
-6. MonitorとTurtleをWired Modem/Cableで同じネットワークへ接続する。
-7. Advanced PeripheralsのInventory Managerを使う場合は、Memory Cardへプレイヤーを登録して接続する。無くても登録・クラフト・在庫表示は使えます。
+3. `factory storage list` またはMonitorのSETTINGSで、材料倉庫を `STORAGE`、Turtleの`top`を`STAGING`、さらに同じ容器のWired Network名（例 `minecraft:barrel_13`）も`STAGING`に設定します。Factoryは`top`を吸引専用のlocal side、ネットワーク名を`pushItems()`専用のdestinationとして分離します。完成品倉庫は`OUTPUT`、対象外は`IGNORE`に設定します。
+4. `factory scan`で、次のように2つの名前が表示されることを確認します。
+
+   ```text
+   staging local: top
+   staging network: minecraft:barrel_13
+   ```
+
+   `cfg.staging_inventory`をネットワーク名へ固定することもできますが、通常は`AUTO`のまま、STAGING roleから自動解決してください。
+
+   CLIでは次のようにlocal側とnetwork側の両方へ設定します。
+
+   ```text
+   factory storage set top STAGING
+   factory storage set minecraft:barrel_13 STAGING
+   ```
+5. Crafty Turtle自身が汎用inventory Peripheralとして検出できる場合は、従来どおり`pushItems()`で正しいcraft slotへ直接転送します。検出できない場合はSTAGINGへ自動fallbackし、`STORAGE → minecraft:barrel_13 → turtle.suckUp() (top) → craft slot` の順で材料を検証します。`top`を`pushItems()`の宛先には使用しません。
+6. 下に完成品用Barrelを置く。Wired OUTPUTへ直接返却できない場合は `turtle.dropDown()` へfallbackします。下BarrelがPeripheralとして認識されない場合も排出できますが、満杯の事前容量検査はできないため、排出失敗時に安全停止します。
+7. MonitorとTurtleをWired Modem/Cableで同じネットワークへ接続する。
+8. Advanced PeripheralsのInventory Managerを使う場合は、Memory Cardへプレイヤーを登録して接続する。無くても登録・クラフト・在庫表示は使えます。
 
 ## インストール
 
@@ -82,7 +97,62 @@ factory dashboard
 top   type: minecraft:barrel, inventory   methods: ... list ...
 left  type: workbench                     methods: ... craft ...
 <monitor> type: monitor
+staging local: top
+staging network: minecraft:barrel_13
 ```
+
+## Computer #2: Wired Storage Export Controller
+
+`cc/storage.lua` はMonitorやTurtleを使わず、Computer #2のターミナルだけで搬出用Chestを統合倉庫へ収納する専用プログラムです。CC:Tweaked 1.120.0のgeneric inventory APIだけを使用し、`list()`でSOURCEと各STORAGEを読み、SOURCE側の`pushItems()`で同じWired Network上の倉庫へ転送します。
+
+構成は次のとおりです。
+
+```text
+[搬出用 Chest + Wired Modem]
+            │
+       Wired Network
+            │
+       [Computer #2]
+            │
+       Wired Network
+            │
+[Create Item Vault / Chest / Barrel ...]
+```
+
+Create Item Vaultを含め、`list()`と`size()`を持つinventoryをSTORAGEに登録できます。SOURCEには`pushItems()`も必要です。Wired Modem経由で表示されたPeripheral名をそのまま使用してください。
+
+インストール:
+
+```text
+wget https://raw.githubusercontent.com/kaede050492/crafty-turtle-factory-os/main/cc/storage.lua /storage
+storage list
+```
+
+設定は追加した順番がSTORAGE #1、#2…の優先順位になります。各倉庫で同じItem ID/NBTのstackを先に探し、その後に空きslotを使います。#1が満杯または部分転送になった場合は残量を#2以降へ送ります。
+
+```text
+storage list
+storage set-source <搬出用ChestのPeripheral名>
+storage add <倉庫1のPeripheral名>
+storage add <倉庫2のPeripheral名>
+storage add <倉庫3のPeripheral名>
+storage status
+storage run
+```
+
+`storage set-source`を実行したPeripheralは自動的にSTORAGE一覧から除外されます。SOURCE自身を`storage add`することもできません。設定はComputer #2の`storage_controller.db`へ保存され、再起動後も残ります。DB更新は一時ファイルから入れ替えるため、書き込み途中の中断で元DBを壊しにくくしています。
+
+`storage run`は約0.2秒間隔でSOURCEの`list()`だけを監視します。転送が必要になったときだけSTORAGEの`list()`を読み、`pushItems()`の戻り値だけに依存せず、転送前後のSOURCEスロットと転送先スロットを検証します。部分転送、倉庫満杯、Peripheral切断、異物化、数量不一致が起きた場合はそのサイクルを安全停止し、SOURCEに残ったアイテムを次周期へ残します。`peripheral` / `peripheral_detach`イベントを受けると接続先を再検出します。
+
+起動中の画面には、SOURCE名、接続中/登録済みSTORAGE数、SOURCEの残量、累計転送数、直近のエラーを表示します。終了は`Ctrl+T`です。
+
+`startup.lua`から自動起動する場合は、Computer #2の`startup.lua`へ次を追加します。
+
+```lua
+shell.run("storage", "run")
+```
+
+`pushItems()`は、SOURCEとSTORAGEの両方が同じWired Network上に接続されている場合に使用できます。CC:Tのinventory API仕様は[generic inventory](https://tweaked.cc/generic_peripheral/inventory.html)と[peripheral](https://tweaked.cc/module/peripheral.html)を参照してください。
 
 ## 3x3 Advanced Monitor
 
@@ -210,7 +280,7 @@ factory queue clear
 検出されたgeneric inventoryは、初回は原則 `STORAGE` になります。Crafty Turtle、Monitor、Modem等はinventoryとして誤認しないよう除外します。役割は次の5種類です。
 
 - `STORAGE`: 材料在庫の集計・材料取得・残り物返却に使用
-- `STAGING`: Turtleの`top`に置く専用中継inventory。材料を一種類ずつ投入して検証する
+- `STAGING`: Turtleの`top`に置く専用中継inventory。local側とWired Network側の両方へ同じroleを設定する。`top`は`turtle.suckUp()`と内容検証にだけ使い、`pushItems()`の宛先はネットワーク名を使う
 - `CRAFTER`: 材料倉庫から除外する予備・加工機用inventory
 - `OUTPUT`: 完成品の返却先。STOCK集計から除外
 - `IGNORE`: Factory OSから完全に除外

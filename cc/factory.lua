@@ -18,8 +18,8 @@ local cfg = {
   storage_file = "factory_storage.db",
   turtle_inventory = "AUTO",  -- optional generic inventory view of this turtle
   output_inventory = "AUTO",  -- optional explicit OUTPUT inventory name
-  staging_inventory = "AUTO", -- dedicated inventory above the turtle
-  staging_side = "top",       -- turtle.suckUp() source
+  staging_inventory = "AUTO", -- Wired Network destination name, or AUTO
+  staging_side = "top",       -- local Turtle side used by turtle.suckUp()
   craft_peripheral = "AUTO",   -- normally left=workbench/craft
   monitor = "AUTO",
   gpu = "",                   -- disabled: use the CC:T Advanced Monitor path
@@ -125,6 +125,11 @@ local P = {
   manager = nil,
   turtle_inventory_name = nil,
   turtle_inventory = nil,
+  staging_local_name = nil,
+  staging_local = nil,
+  staging_network_name = nil,
+  staging_network = nil,
+  -- Compatibility alias: this is always the Wired Network name.
   staging_name = nil,
   staging = nil,
   inventories = {},
@@ -251,6 +256,10 @@ local function resetPeripherals()
   P.manager = nil
   P.turtle_inventory_name = nil
   P.turtle_inventory = nil
+  P.staging_local_name = nil
+  P.staging_local = nil
+  P.staging_network_name = nil
+  P.staging_network = nil
   P.staging_name = nil
   P.staging = nil
   P.inventories = {}
@@ -275,6 +284,12 @@ local function defaultRole(name)
   if name == cfg.staging_side then
     return "STAGING"
   end
+  if name == P.staging_name and configured(P.staging_name) then
+    return "STAGING"
+  end
+  if name == cfg.staging_inventory and configured(cfg.staging_inventory) then
+    return "STAGING"
+  end
   if name == P.turtle_inventory_name then
     return "IGNORE"
   end
@@ -282,6 +297,11 @@ local function defaultRole(name)
 end
 
 local function roleFor(name)
+  if name == cfg.staging_side then return "STAGING" end
+  if name == P.staging_name and configured(P.staging_name) then return "STAGING" end
+  if name == cfg.staging_inventory and configured(cfg.staging_inventory) then
+    return "STAGING"
+  end
   local role = storageState.roles[name]
   if validRole(role) then return role end
   return defaultRole(name)
@@ -422,32 +442,69 @@ local function resolvePeripherals(force)
   end
   P.turtle_inventory_name, P.turtle_inventory = turtleInventoryName, turtleInventory
 
-  local stagingName = cfg.staging_inventory
-  if stagingName == "AUTO" then
-    if peripheral.isPresent(cfg.staging_side) and isTransferInventory(cfg.staging_side)
-      and roleFor(cfg.staging_side) == "STAGING" then
-      stagingName = cfg.staging_side
+  -- STAGING has two deliberately separate identities:
+  --   staging_local_name   = "top" on the Turtle, for suckUp/list()
+  --   staging_network_name = e.g. "minecraft:barrel_13", for pushItems()
+  -- Passing the local side to pushItems() causes "Target 'top' does not
+  -- exist", even though turtle.suckUp("top") is correct.
+  P.staging_local_name, P.staging_local = nil, nil
+  P.staging_network_name, P.staging_network = nil, nil
+  P.staging_name, P.staging = nil, nil
+
+  local stagingLocalName = cfg.staging_side
+  local stagingLocal = peripheral.isPresent(stagingLocalName)
+    and peripheral.wrap(stagingLocalName) or nil
+  if not stagingLocal or not isTransferInventory(stagingLocalName) then
+    stagingLocal = nil
+    log("WARN", "STAGING local side is unavailable: " .. tostring(stagingLocalName))
+  end
+
+  local stagingNetworkName = nil
+  if configured(cfg.staging_inventory) and cfg.staging_inventory ~= stagingLocalName then
+    if isTransferInventory(cfg.staging_inventory) then
+      stagingNetworkName = cfg.staging_inventory
     else
-      for _, name in ipairs(sortedPeripheralNames()) do
-        if roleFor(name) == "STAGING" and isTransferInventory(name) then
-          stagingName = name
-          break
-        end
+      log("WARN", "Configured STAGING network inventory is unavailable: " ..
+        tostring(cfg.staging_inventory))
+    end
+  elseif configured(cfg.staging_inventory) then
+    log("WARN", "staging_inventory must be a Wired Network name, not " ..
+      tostring(stagingLocalName))
+  end
+
+  -- AUTO resolves the network endpoint from the persisted STAGING role.
+  -- The local side is skipped: it is valid for suckUp(), never for a network
+  -- push destination.
+  if not stagingNetworkName then
+    for _, name in ipairs(sortedPeripheralNames()) do
+      if name ~= stagingLocalName and roleFor(name) == "STAGING"
+        and isTransferInventory(name) then
+        stagingNetworkName = name
+        break
       end
     end
   end
-  local staging = configured(stagingName) and peripheral.wrap(stagingName) or nil
-  if not staging or not isTransferInventory(stagingName) then
-    stagingName, staging = nil, nil
+
+  local stagingNetwork = stagingNetworkName and peripheral.wrap(stagingNetworkName) or nil
+  if stagingNetworkName and (not stagingNetwork or not isTransferInventory(stagingNetworkName)
+    or type(stagingNetwork.pushItems) ~= "function") then
+    log("WARN", "STAGING network endpoint is unavailable: " .. tostring(stagingNetworkName))
+    stagingNetworkName, stagingNetwork = nil, nil
   end
-  if stagingName and stagingName ~= cfg.staging_side then
-    log("ERROR", "STAGINGは" .. cfg.staging_side .. "側に必要です: " .. stagingName)
-    stagingName, staging = nil, nil
-  end
-  P.staging_name, P.staging = stagingName, staging
+
+  P.staging_local_name, P.staging_local = stagingLocal and stagingLocalName or nil, stagingLocal
+  P.staging_network_name, P.staging_network = stagingNetworkName, stagingNetwork
+  -- Existing code and UI use staging_name; its meaning is now explicitly the
+  -- network destination name, never the local Turtle side.
+  P.staging_name, P.staging = stagingNetworkName, stagingLocal
   scanInventories()
   state.monitor_name = P.monitor_name
   return P
+end
+
+local function stagingSummary()
+  return tostring(P.staging_local_name or "unavailable") .. " -> " ..
+    tostring(P.staging_network_name or "unavailable")
 end
 
 local function scan()
@@ -466,7 +523,8 @@ local function scan()
   local ok, p = pcall(resolvePeripherals, true)
   if ok then
     print("turtle inventory target: " .. tostring(p.turtle_inventory_name or "unavailable"))
-    print("staging inventory: " .. tostring(p.staging_name or "unavailable"))
+    print("staging local: " .. tostring(p.staging_local_name or "unavailable"))
+    print("staging network: " .. tostring(p.staging_network_name or "unavailable"))
     print("STORAGE inventories: " .. tostring(#p.storage))
     print("Tom's GPU: " .. tostring(p.gpu_name or "unavailable"))
     if p.gpu then
@@ -543,7 +601,10 @@ local function setStorageRole(name, role)
   if not configured(name) then return false, "inventory名が必要です。" end
   role = tostring(role or ""):upper()
   if not validRole(role) then
-    return false, "roleは STORAGE / CRAFTER / OUTPUT / IGNORE のいずれかです。"
+    return false, "roleは STORAGE / STAGING / CRAFTER / OUTPUT / IGNORE のいずれかです。"
+  end
+  if name == cfg.staging_side and role ~= "STAGING" then
+    return false, cfg.staging_side .. "はSTAGING固定です。"
   end
   storageState.roles[name] = role
   saveStorageConfig()
@@ -1036,8 +1097,11 @@ end
 
 local function stagingReady()
   resolvePeripherals()
-  if not P.staging_name or not P.staging then
-    return false, "STAGING inventoryが見つかりません。"
+  if not P.staging_local_name or not P.staging then
+    return false, "STAGING local side (" .. tostring(cfg.staging_side) .. ")が見つかりません。"
+  end
+  if not P.staging_network_name or not P.staging_network then
+    return false, "STAGINGのWired Network名が解決できません。"
   end
   return true
 end
@@ -1098,7 +1162,8 @@ local function transferSourceToStaging(source, sourceSlot, amount, targetSlot, e
   end
   local beforeStaging = inventoryStacks(P.staging)[targetSlot]
   if beforeStaging then return false, 0, "STAGINGの転送先slotが空ではありません。" end
-  local callOk, moved = pcall(source.object.pushItems, P.staging_name,
+  -- pushItems() must receive the Wired Network endpoint, never "top".
+  local callOk, moved = pcall(source.object.pushItems, P.staging_network_name,
     sourceSlot, amount, targetSlot)
   if not callOk or type(moved) ~= "number" then
     return false, 0, tostring(moved or "STAGING pushItems()失敗")
@@ -1189,9 +1254,11 @@ local function returnStagingToStorage()
         end
         local before = beforeList[slot]
         if not before then break end
-        local callOk = type(P.staging.pushItems) == "function"
+        -- Return through the Wired Network endpoint as well. The local
+        -- "top" name is only for turtle.suckUp() and local inspection.
+        local callOk = P.staging_network and type(P.staging_network.pushItems) == "function"
         if callOk then
-          pcall(P.staging.pushItems, destination.name, slot, remaining)
+          pcall(P.staging_network.pushItems, destination.name, slot, remaining)
         end
         local afterList, afterReason = stagingStacks()
         if not afterList then
@@ -2287,7 +2354,7 @@ local function drawHome(display)
     line(display, 3, ("STORAGE: %d  slots: %d/%d"):format(storageCount, usedSlots, totalSlots))
     line(display, 4, ("DISPLAY: %s  KEY: %s"):format(
       state.display_mode, P.keyboard_name and "ON" or "OFF"), colors.lightGray)
-    line(display, 5, "STAGING: " .. tostring(P.staging_name or "unavailable"))
+    line(display, 5, "STAGING: " .. stagingSummary())
     line(display, 6, "TRANSFER: " .. tostring(P.turtle_inventory_name or "staging fallback"))
     line(display, 7, "JOB: " .. tostring(state.auto_current or "idle"), colors.lightBlue)
     line(display, 8, ("BUILD: %s %s"):format(
@@ -2497,8 +2564,8 @@ local function drawSettings(display)
   end
   if buttonStart > 8 then
     line(display, buttonStart - 5, "Tap role: STORAGE/STAGING/CRAFTER/OUTPUT/IGNORE", colors.lightGray)
-    line(display, buttonStart - 4, "staging: " .. tostring(P.staging_name or "unavailable"),
-    P.staging_name and colors.lightBlue or colors.red)
+    line(display, buttonStart - 4, "staging: " .. stagingSummary(),
+    P.staging_network_name and colors.lightBlue or colors.red)
     line(display, buttonStart - 3, "turtle: " .. tostring(P.turtle_inventory_name or "unavailable"),
     P.turtle_inventory_name and colors.lightBlue or colors.red)
     line(display, buttonStart - 2, "craft: " .. tostring(P.craft_name or "turtle.craft"))
@@ -2927,7 +2994,8 @@ local function cliStorage(args)
       print(("%-32s %s"):format(entry.name, entry.role))
     end
     print("turtle inventory: " .. tostring(P.turtle_inventory_name or "unavailable"))
-    print("staging inventory: " .. tostring(P.staging_name or "unavailable"))
+    print("staging local: " .. tostring(P.staging_local_name or "unavailable"))
+    print("staging network: " .. tostring(P.staging_network_name or "unavailable"))
   elseif action == "set" then
     local name, role = args[3], args[4]
     local ok, reason = setStorageRole(name, role)
