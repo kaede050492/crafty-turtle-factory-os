@@ -90,9 +90,11 @@ left  type: workbench                     methods: ... craft ...
 
 タッチ判定は描画したボタンの実際のx/y座標から生成するため、文字スケールやMonitorサイズが変わっても`monitor_touch`の位置がずれません。画面が極端に小さい場合は、0.5スケールと1列レイアウトで操作ボタンを優先して表示します。
 
+通常の表示先はCC:TweakedのAdvanced Monitorです。各行はCC:Tの`blit()`でまとめて送信するため、毎回の色変更と文字書き込みを減らしています。タッチイベントを受け取ったフレーム内で操作を処理して即時再描画し、AUTO監視やQueueの無関係なタイマーでは画面を再描画しません。日本語などのUTF-8文字列は安全のため通常の`write()`経路へ戻ります。
+
 ## Tom's Peripherals GPU / Keyboard
 
-Tom's PeripheralsのGPUと3×5 Bitmap Monitorを同じWired Modemネットワークへ接続している場合、起動時にGPUを自動検出します。`refreshSize()`後に`setSize(64)`と`createWindow()`を使って描画コンテキストを作り、`getSize()`のピクセルサイズから文字セルを計算してVRAMへ1フレーム分だけ描画します。各行をMonitorへ個別送信せず、`window.sync()`→GPUの`sync()`を最後に行うため、画面更新が軽くなります。GPUの実在APIが揃わない場合は自動的に通常のAdvanced Monitorへ戻ります。
+Tom's PeripheralsのGPUは互換表示用のオプションです。既定では無効で、CC:TのAdvanced Monitorを使用します。GPUを使う場合だけ、`factory.lua`冒頭の`cfg.gpu = ""`を`cfg.gpu = "AUTO"`または実際のPeripheral名へ変更してください。GPU経路は`refreshSize()`後に`setSize(64)`と`createWindow()`を使って描画コンテキストを作り、`getSize()`のピクセルサイズから文字セルを計算してVRAMへ1フレーム分だけ描画します。各行をMonitorへ個別送信せず、`window.sync()`→GPUの`sync()`を最後に行います。
 
 Tom's Keyboardが検出されると`setFireNativeEvents(true)`を設定し、通常のCC:T `key` / `char`イベントとして扱います。複数接続などで自動検出できない場合は、冒頭の`cfg.gpu` / `cfg.keyboard`をPeripheral名に変更してください。
 
@@ -114,11 +116,11 @@ Esc         前の画面へ戻る
 Delete      詳細画面のレシピ削除
 ```
 
-キーボード未接続でも、従来どおりMonitorのタッチ操作を利用できます。Tom's Bitmap Monitorを使用する場合はGPUの`tm_monitor_touch` / `tm_monitor_mouse_click`を文字セル座標へ変換して同じボタン判定を行います。GPUが一時切断・同期失敗した場合はそのフレームを停止し、接続されている通常Monitorへフォールバックします。
+キーボード未接続でも、従来どおりCC:T Monitorのタッチ操作を利用できます。GPUを有効にした場合はTom's Bitmap Monitorの`tm_monitor_touch` / `tm_monitor_mouse_click`を文字セル座標へ変換して同じボタン判定を行います。GPUが一時切断・同期失敗した場合はそのフレームを停止し、接続されている通常Monitorへフォールバックします。
 
 参照: [Tom's Peripherals](https://modrinth.com/mod/toms-peripherals)、[GPU API](https://github.com/tom5454/Toms-Peripherals/wiki/GPUImpl)、[Keyboard API](https://github.com/tom5454/Toms-Peripherals/wiki/Keyboard)
 
-GPU単体の描画確認は次で行えます。画面に`GPU TEST`が出れば、Monitor接続とGPU描画は成功しています。
+GPU単体の描画確認は`cfg.gpu`を有効にした場合だけ次で行えます。画面に`GPU TEST`が出れば、Monitor接続とGPU描画は成功しています。通常のCC:T Monitorだけを使う場合は`factory scan`と`factory dashboard`を実行してください。
 
 ```text
 factory scan

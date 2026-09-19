@@ -22,7 +22,7 @@ local cfg = {
   staging_side = "top",       -- turtle.suckUp() source
   craft_peripheral = "AUTO",   -- normally left=workbench/craft
   monitor = "AUTO",
-  gpu = "AUTO",               -- optional Tom's Peripherals GPU
+  gpu = "",                   -- disabled: use the CC:T Advanced Monitor path
   gpu_resolution = 64,         -- Tom's Bitmap Monitor resolution per block
   keyboard = "AUTO",          -- optional Tom's Peripherals keyboard
   inventory_manager = "AUTO",  -- optional Advanced Peripherals hand reader
@@ -2167,22 +2167,46 @@ local function ensureMonitorLayout(display)
   return monitorLayout.width, monitorLayout.height
 end
 
+-- CC:T monitors support blit(), which sends one text/colour run instead of
+-- making separate colour and write calls for every line.  Keep a write()
+-- fallback for GPU surfaces and for UTF-8 text: blit() uses one colour code
+-- per rendered character, while Lua's # operator counts UTF-8 bytes.
+local function writeDisplayText(display, text, foreground, background)
+  text = tostring(text or "")
+  if text == "" then return end
+
+  local ascii = true
+  for index = 1, #text do
+    if text:byte(index) > 127 then
+      ascii = false
+      break
+    end
+  end
+
+  if ascii and type(display.blit) == "function" and type(colors.toBlit) == "function" then
+    local foregroundCode = colors.toBlit(foreground or colors.white)
+    local backgroundCode = colors.toBlit(background or colors.black)
+    display.blit(text, string.rep(foregroundCode, #text), string.rep(backgroundCode, #text))
+  else
+    setColour(display, foreground or colors.white, background or colors.black)
+    display.write(text)
+  end
+end
+
 local function line(display, y, text, colour)
   local width, height = ensureMonitorLayout(display)
   if y < 1 or y > height then return end
-  if colour then setColour(display, colour, colors.black) end
   display.setCursorPos(1, y)
-  display.write(tostring(text or ""):sub(1, width))
+  writeDisplayText(display, tostring(text or ""):sub(1, width), colour, colors.black)
 end
 
 local function lineAt(display, x, y, text, colour)
   local screenWidth, height = ensureMonitorLayout(display)
   x = math.max(1, math.floor(tonumber(x) or 1))
   if y < 1 or y > height or x > screenWidth then return end
-  if colour then setColour(display, colour, colors.black) end
   local maxLength = screenWidth - x + 1
   display.setCursorPos(x, y)
-  display.write(tostring(text or ""):sub(1, maxLength))
+  writeDisplayText(display, tostring(text or ""):sub(1, maxLength), colour, colors.black)
 end
 
 local function button(display, x, y, width, label, action)
